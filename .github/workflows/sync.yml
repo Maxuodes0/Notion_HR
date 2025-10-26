@@ -1,0 +1,29 @@
+name: Sync Notion Leave Requests
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"  # كل نص ساعة
+  workflow_dispatch: {}     # تقدر تشغله يدوي
+
+jobs:
+  run-sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Use Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install deps
+        run: npm install
+
+      - name: Run sync
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          DATABASE_ID_EMPLOYEES: ${{ secrets.DATABASE_ID_EMPLOYEES }}
+          DATABASE_ID_LEAVE_REQUESTS: ${{ secrets.DATABASE_ID_LEAVE_REQUESTS }}
+        run: npm start

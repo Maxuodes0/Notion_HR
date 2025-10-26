@@ -1,0 +1,12 @@
+{
+  "name": "notion_hr",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "sync.js",
+  "scripts": {
+    "start": "node sync.js"
+  },
+  "dependencies": {
+    "@notionhq/client": "^2.2.15"
+  }
+}

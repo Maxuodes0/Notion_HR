@@ -2,7 +2,7 @@ name: Sync Notion Leave Requests
 
 on:
   schedule:
-    - cron: "*/30 * * * *"  # كل نص ساعة
+  - cron: "* * * * *"     # كل دقيقة
   workflow_dispatch: {}     # تقدر تشغله يدوي
 
 jobs:

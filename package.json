@@ -2,10 +2,10 @@
   "name": "notion-tables-sync",
   "version": "1.0.0",
   "description": "مزامنة جداول Notion - ربط الموظفين بطلبات الإجازة",
-  "main": "sync-notion-tables.js",
+  "main": "sync.js",
   "scripts": {
-    "start": "node sync-notion-tables.js",
-    "sync": "node sync-notion-tables.js",
+    "start": "node .github/workflows/sync.js",
+    "sync": "node .github/workflows/sync.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [

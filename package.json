@@ -4,8 +4,8 @@
   "description": "مزامنة جداول Notion - ربط الموظفين بطلبات الإجازة",
   "main": "sync.js",
   "scripts": {
-    "start": "node .github/workflows/sync.js",
-    "sync": "node .github/workflows/sync.js",
+    "start": "node sync.js",
+    "sync": "node sync.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [

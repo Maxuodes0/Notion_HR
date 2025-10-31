@@ -1,365 +1,453 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Notion Employee-Leave Request Sync Script
-==========================================
-This script syncs employee data with leave requests in Notion:
-- Links leave requests to employees by matching ID numbers
-- Sets default status for empty leave request statuses
-- Handles Arabic/Hindi numerals conversion
-- Protects against Notion API rate limits
-"""
+#!/usr/bin/env node
+/**
+ * Notion Employee-Leave Request Sync Script (JavaScript)
+ * ======================================================
+ * This script syncs employee data with leave requests in Notion:
+ * - Links leave requests to employees by matching ID numbers
+ * - Sets default status for empty leave request statuses
+ * - Handles Arabic/Hindi numerals conversion
+ * - Protects against Notion API rate limits
+ */
 
-import os
-import time
-from typing import Dict, Any, Optional
-from notion_client import Client
-from notion_client.errors import APIResponseError
+const { Client } = require('@notionhq/client');
 
+/**
+ * NotionSync class handles syncing between Notion databases
+ */
+class NotionSync {
+  /**
+   * Initialize the Notion sync client
+   * @param {string} apiKey - Notion integration API key
+   * @param {string} employeesDbId - Database ID for employees table
+   * @param {string} leaveRequestsDbId - Database ID for leave requests table
+   */
+  constructor(apiKey, employeesDbId, leaveRequestsDbId) {
+    this.notion = new Client({ auth: apiKey });
+    this.employeesDbId = employeesDbId;
+    this.leaveRequestsDbId = leaveRequestsDbId;
+    this.idToPageMap = new Map();
+  }
 
-class NotionSync:
-    """Handles syncing between Notion databases with rate limit protection."""
-    
-    def __init__(self, api_key: str, employees_db_id: str, leave_requests_db_id: str):
-        """
-        Initialize the Notion sync client.
-        
-        Args:
-            api_key: Notion integration API key
-            employees_db_id: Database ID for employees table
-            leave_requests_db_id: Database ID for leave requests table
-        """
-        self.notion = Client(auth=api_key)
-        self.employees_db_id = employees_db_id
-        self.leave_requests_db_id = leave_requests_db_id
-        self.id_to_page_map: Dict[str, str] = {}
-        
-    @staticmethod
-    def normalize_id_number(id_value: Any) -> Optional[str]:
-        """
-        Normalize ID numbers by converting Arabic/Hindi numerals to Western numerals.
-        
-        Args:
-            id_value: The ID value (can be string, number, or None)
-            
-        Returns:
-            Normalized ID as string, or None if invalid
-        """
-        if id_value is None:
-            return None
-            
-        # Convert to string first
-        id_str = str(id_value).strip()
-        
-        if not id_str:
-            return None
-        
-        # Arabic-Indic (Eastern Arabic) numerals: ٠١٢٣٤٥٦٧٨٩
-        arabic_to_western = str.maketrans('٠١٢٣٤٥٦٧٨٩', '0123456789')
-        
-        # Hindi numerals: ०१२३४५६७८९
-        hindi_to_western = str.maketrans('०१२३४५६७८९', '0123456789')
-        
-        # Apply both translations
-        normalized = id_str.translate(arabic_to_western).translate(hindi_to_western)
-        
-        # Remove any non-numeric characters
-        normalized = ''.join(c for c in normalized if c.isdigit())
-        
-        return normalized if normalized else None
-    
-    def api_call_with_retry(self, func, *args, max_retries: int = 5, **kwargs):
-        """
-        Execute Notion API call with automatic retry on rate limit (429 error).
-        
-        Args:
-            func: The API function to call
-            max_retries: Maximum number of retry attempts
-            *args, **kwargs: Arguments to pass to the function
-            
-        Returns:
-            The result of the API call
-        """
-        for attempt in range(max_retries):
-            try:
-                return func(*args, **kwargs)
-            except APIResponseError as e:
-                if e.code == 'rate_limited' or (hasattr(e, 'status') and e.status == 429):
-                    if attempt < max_retries - 1:
-                        # Extract retry-after from headers if available, otherwise use exponential backoff
-                        wait_time = 2 ** attempt  # Exponential backoff: 1, 2, 4, 8, 16 seconds
-                        print(f"⚠️  Rate limit hit. Waiting {wait_time} seconds before retry {attempt + 1}/{max_retries}...")
-                        time.sleep(wait_time)
-                    else:
-                        print(f"❌ Rate limit exceeded after {max_retries} attempts")
-                        raise
-                else:
-                    raise
-        
-    def extract_property_value(self, properties: Dict, property_name: str, property_type: str) -> Any:
-        """
-        Extract value from Notion property safely.
-        
-        Args:
-            properties: The properties dictionary from a Notion page
-            property_name: Name of the property to extract
-            property_type: Expected type (title, rich_text, number, select, status, relation)
-            
-        Returns:
-            The extracted value or None
-        """
-        if property_name not in properties:
-            return None
-            
-        prop = properties[property_name]
-        
-        try:
-            if property_type == 'title':
-                return prop.get('title', [{}])[0].get('plain_text', '') if prop.get('title') else ''
-            elif property_type == 'rich_text':
-                return prop.get('rich_text', [{}])[0].get('plain_text', '') if prop.get('rich_text') else ''
-            elif property_type == 'number':
-                return prop.get('number')
-            elif property_type == 'select':
-                return prop.get('select', {}).get('name') if prop.get('select') else None
-            elif property_type == 'status':
-                return prop.get('status', {}).get('name') if prop.get('status') else None
-            elif property_type == 'relation':
-                return prop.get('relation', [])
-        except (KeyError, IndexError, TypeError):
-            return None
-    
-    def build_employee_index(self):
-        """
-        Build an index mapping ID numbers to employee page IDs.
-        Reads all employees from the employees database.
-        """
-        print("🔍 Building employee index...")
-        
-        has_more = True
-        start_cursor = None
-        employee_count = 0
-        
-        while has_more:
-            response = self.api_call_with_retry(
-                self.notion.databases.query,
-                database_id=self.employees_db_id,
-                start_cursor=start_cursor
-            )
-            
-            for page in response.get('results', []):
-                page_id = page['id']
-                properties = page['properties']
-                
-                # Try to get ID number from different possible property names and types
-                id_number = None
-                
-                # Try common property names
-                for prop_name in ['رقم الهوية', 'ID Number', 'رقم']:
-                    if prop_name in properties:
-                        prop_type = properties[prop_name]['type']
-                        if prop_type == 'number':
-                            id_number = self.extract_property_value(properties, prop_name, 'number')
-                        elif prop_type == 'rich_text':
-                            id_number = self.extract_property_value(properties, prop_name, 'rich_text')
-                        
-                        if id_number:
-                            break
-                
-                # Normalize the ID
-                normalized_id = self.normalize_id_number(id_number)
-                
-                if normalized_id:
-                    self.id_to_page_map[normalized_id] = page_id
-                    employee_count += 1
-                    
-                    # Get employee name for logging
-                    employee_name = self.extract_property_value(properties, 'اسم الموظف', 'title') or \
-                                  self.extract_property_value(properties, 'Name', 'title') or \
-                                  'Unknown'
-                    
-                    print(f"  ✓ {employee_name}: {normalized_id} → {page_id}")
-            
-            has_more = response.get('has_more', False)
-            start_cursor = response.get('next_cursor')
-        
-        print(f"✅ Indexed {employee_count} employees\n")
-    
-    def sync_leave_requests(self):
-        """
-        Sync leave requests with employee data:
-        - Link requests to employees by matching ID numbers
-        - Set default status if empty
-        """
-        print("🔄 Syncing leave requests...")
-        
-        has_more = True
-        start_cursor = None
-        updated_count = 0
-        skipped_count = 0
-        error_count = 0
-        
-        while has_more:
-            response = self.api_call_with_retry(
-                self.notion.databases.query,
-                database_id=self.leave_requests_db_id,
-                start_cursor=start_cursor
-            )
-            
-            for page in response.get('results', []):
-                page_id = page['id']
-                properties = page['properties']
-                
-                # Extract ID number from leave request
-                request_id = None
-                for prop_name in ['رقم الهوية', 'ID Number', 'رقم']:
-                    if prop_name in properties:
-                        prop_type = properties[prop_name]['type']
-                        if prop_type == 'number':
-                            request_id = self.extract_property_value(properties, prop_name, 'number')
-                        elif prop_type == 'rich_text':
-                            request_id = self.extract_property_value(properties, prop_name, 'rich_text')
-                        
-                        if request_id:
-                            break
-                
-                normalized_request_id = self.normalize_id_number(request_id)
-                
-                if not normalized_request_id:
-                    print(f"  ⚠️  Skipping request {page_id}: No valid ID number")
-                    skipped_count += 1
-                    continue
-                
-                # Check if we need to update this record
-                updates = {}
-                
-                # 1. Check employee relation
-                employee_relation = None
-                for prop_name in ['اسم الموظف', 'Employee Name', 'الموظف']:
-                    if prop_name in properties:
-                        employee_relation = self.extract_property_value(properties, prop_name, 'relation')
-                        relation_prop_name = prop_name
-                        break
-                
-                if normalized_request_id in self.id_to_page_map:
-                    employee_page_id = self.id_to_page_map[normalized_request_id]
-                    
-                    # Check if relation needs update
-                    if not employee_relation or employee_page_id not in [r['id'] for r in employee_relation]:
-                        updates[relation_prop_name] = {
-                            'relation': [{'id': employee_page_id}]
-                        }
-                
-                # 2. Check status
-                status_value = None
-                status_prop_name = None
-                
-                for prop_name in ['حالة الطلب', 'Status', 'الحالة']:
-                    if prop_name in properties:
-                        prop_type = properties[prop_name]['type']
-                        if prop_type == 'select':
-                            status_value = self.extract_property_value(properties, prop_name, 'select')
-                        elif prop_type == 'status':
-                            status_value = self.extract_property_value(properties, prop_name, 'status')
-                        
-                        status_prop_name = prop_name
-                        break
-                
-                if status_prop_name and not status_value:
-                    prop_type = properties[status_prop_name]['type']
-                    if prop_type == 'select':
-                        updates[status_prop_name] = {
-                            'select': {'name': 'قيد الانتظار'}
-                        }
-                    elif prop_type == 'status':
-                        updates[status_prop_name] = {
-                            'status': {'name': 'قيد الانتظار'}
-                        }
-                
-                # Apply updates if any
-                if updates:
-                    try:
-                        self.api_call_with_retry(
-                            self.notion.pages.update,
-                            page_id=page_id,
-                            properties=updates
-                        )
-                        
-                        update_desc = []
-                        if relation_prop_name in updates:
-                            update_desc.append(f"linked to employee (ID: {normalized_request_id})")
-                        if status_prop_name in updates:
-                            update_desc.append("status set to 'قيد الانتظار'")
-                        
-                        print(f"  ✓ Updated request {page_id}: {', '.join(update_desc)}")
-                        updated_count += 1
-                        
-                        # Small delay to avoid rate limiting
-                        time.sleep(0.3)
-                        
-                    except Exception as e:
-                        print(f"  ❌ Error updating {page_id}: {str(e)}")
-                        error_count += 1
-                else:
-                    skipped_count += 1
-            
-            has_more = response.get('has_more', False)
-            start_cursor = response.get('next_cursor')
-        
-        print(f"\n📊 Sync Summary:")
-        print(f"  ✅ Updated: {updated_count}")
-        print(f"  ⏭️  Skipped: {skipped_count}")
-        print(f"  ❌ Errors: {error_count}")
-    
-    def run(self):
-        """Execute the full sync process."""
-        print("=" * 60)
-        print("🚀 Starting Notion Sync Process")
-        print("=" * 60 + "\n")
-        
-        try:
-            self.build_employee_index()
-            self.sync_leave_requests()
-            
-            print("\n" + "=" * 60)
-            print("✅ Sync completed successfully!")
-            print("=" * 60)
-            
-        except Exception as e:
-            print(f"\n❌ Fatal error: {str(e)}")
-            raise
+  /**
+   * Normalize ID numbers by converting Arabic/Hindi numerals to Western numerals
+   * @param {any} idValue - The ID value (can be string, number, or null)
+   * @returns {string|null} Normalized ID as string, or null if invalid
+   */
+  static normalizeIdNumber(idValue) {
+    if (!idValue && idValue !== 0) {
+      return null;
+    }
 
+    // Convert to string first
+    let idStr = String(idValue).trim();
 
-def main():
-    """Main entry point."""
-    # Load configuration from environment variables
-    NOTION_API_KEY = os.getenv('NOTION_API_KEY')
-    EMPLOYEES_DB_ID = os.getenv('EMPLOYEES_DB_ID')
-    LEAVE_REQUESTS_DB_ID = os.getenv('LEAVE_REQUESTS_DB_ID')
-    
-    # Validate configuration
-    if not all([NOTION_API_KEY, EMPLOYEES_DB_ID, LEAVE_REQUESTS_DB_ID]):
-        print("❌ Error: Missing required environment variables!")
-        print("\nPlease set the following environment variables:")
-        print("  - NOTION_API_KEY: Your Notion integration API key")
-        print("  - EMPLOYEES_DB_ID: Database ID for employees table")
-        print("  - LEAVE_REQUESTS_DB_ID: Database ID for leave requests table")
-        print("\nExample:")
-        print("  export NOTION_API_KEY='secret_...'")
-        print("  export EMPLOYEES_DB_ID='...'")
-        print("  export LEAVE_REQUESTS_DB_ID='...'")
-        return 1
-    
-    # Run the sync
-    sync = NotionSync(
-        api_key=NOTION_API_KEY,
-        employees_db_id=EMPLOYEES_DB_ID,
-        leave_requests_db_id=LEAVE_REQUESTS_DB_ID
-    )
-    
-    sync.run()
-    return 0
+    if (!idStr) {
+      return null;
+    }
 
+    // Arabic-Indic (Eastern Arabic) numerals: ٠١٢٣٤٥٦٧٨٩
+    const arabicNumerals = '٠١٢٣٤٥٦٧٨٩';
+    const westernNumerals = '0123456789';
 
-if __name__ == '__main__':
-    exit(main())
+    // Hindi numerals: ०१२३४५६७८९
+    const hindiNumerals = '०१२३४५६७८९';
+
+    // Replace Arabic numerals
+    for (let i = 0; i < arabicNumerals.length; i++) {
+      idStr = idStr.replace(new RegExp(arabicNumerals[i], 'g'), westernNumerals[i]);
+    }
+
+    // Replace Hindi numerals
+    for (let i = 0; i < hindiNumerals.length; i++) {
+      idStr = idStr.replace(new RegExp(hindiNumerals[i], 'g'), westernNumerals[i]);
+    }
+
+    // Remove any non-numeric characters
+    const normalized = idStr.replace(/\D/g, '');
+
+    return normalized || null;
+  }
+
+  /**
+   * Execute Notion API call with automatic retry on rate limit (429 error)
+   * @param {Function} apiCall - The API function to call
+   * @param {number} maxRetries - Maximum number of retry attempts
+   * @returns {Promise} The result of the API call
+   */
+  async apiCallWithRetry(apiCall, maxRetries = 5) {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        return await apiCall();
+      } catch (error) {
+        const isRateLimit = 
+          error.code === 'rate_limited' || 
+          error.status === 429 ||
+          (error.message && error.message.includes('rate_limited'));
+
+        if (isRateLimit && attempt < maxRetries - 1) {
+          // Exponential backoff: 1, 2, 4, 8, 16 seconds
+          const waitTime = Math.pow(2, attempt);
+          console.log(`⚠️  Rate limit hit. Waiting ${waitTime} seconds before retry ${attempt + 1}/${maxRetries}...`);
+          await this.sleep(waitTime * 1000);
+        } else if (isRateLimit) {
+          console.log(`❌ Rate limit exceeded after ${maxRetries} attempts`);
+          throw error;
+        } else {
+          throw error;
+        }
+      }
+    }
+  }
+
+  /**
+   * Sleep for specified milliseconds
+   * @param {number} ms - Milliseconds to sleep
+   * @returns {Promise}
+   */
+  sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Extract value from Notion property safely
+   * @param {object} properties - The properties object from a Notion page
+   * @param {string} propertyName - Name of the property to extract
+   * @param {string} propertyType - Expected type
+   * @returns {any} The extracted value or null
+   */
+  extractPropertyValue(properties, propertyName, propertyType) {
+    if (!properties[propertyName]) {
+      return null;
+    }
+
+    const prop = properties[propertyName];
+
+    try {
+      switch (propertyType) {
+        case 'title':
+          return prop.title?.[0]?.plain_text || '';
+        
+        case 'rich_text':
+          return prop.rich_text?.[0]?.plain_text || '';
+        
+        case 'number':
+          return prop.number;
+        
+        case 'select':
+          return prop.select?.name || null;
+        
+        case 'status':
+          return prop.status?.name || null;
+        
+        case 'relation':
+          return prop.relation || [];
+        
+        default:
+          return null;
+      }
+    } catch (error) {
+      return null;
+    }
+  }
+
+  /**
+   * Build an index mapping ID numbers to employee page IDs
+   * Reads all employees from the employees database
+   */
+  async buildEmployeeIndex() {
+    console.log('🔍 Building employee index...');
+
+    let hasMore = true;
+    let startCursor = undefined;
+    let employeeCount = 0;
+
+    while (hasMore) {
+      const response = await this.apiCallWithRetry(async () => {
+        return await this.notion.databases.query({
+          database_id: this.employeesDbId,
+          start_cursor: startCursor,
+        });
+      });
+
+      for (const page of response.results) {
+        const pageId = page.id;
+        const properties = page.properties;
+
+        // Try to get ID number from different possible property names and types
+        let idNumber = null;
+
+        // Try common property names
+        const idPropertyNames = ['رقم الهوية', 'ID Number', 'رقم'];
+        
+        for (const propName of idPropertyNames) {
+          if (properties[propName]) {
+            const propType = properties[propName].type;
+            
+            if (propType === 'number') {
+              idNumber = this.extractPropertyValue(properties, propName, 'number');
+            } else if (propType === 'rich_text') {
+              idNumber = this.extractPropertyValue(properties, propName, 'rich_text');
+            }
+
+            if (idNumber) {
+              break;
+            }
+          }
+        }
+
+        // Normalize the ID
+        const normalizedId = NotionSync.normalizeIdNumber(idNumber);
+
+        if (normalizedId) {
+          this.idToPageMap.set(normalizedId, pageId);
+          employeeCount++;
+
+          // Get employee name for logging
+          const employeeName = 
+            this.extractPropertyValue(properties, 'اسم الموظف', 'title') ||
+            this.extractPropertyValue(properties, 'Name', 'title') ||
+            'Unknown';
+
+          console.log(`  ✓ ${employeeName}: ${normalizedId} → ${pageId}`);
+        }
+      }
+
+      hasMore = response.has_more;
+      startCursor = response.next_cursor;
+    }
+
+    console.log(`✅ Indexed ${employeeCount} employees\n`);
+  }
+
+  /**
+   * Sync leave requests with employee data
+   * - Link requests to employees by matching ID numbers
+   * - Set default status if empty
+   */
+  async syncLeaveRequests() {
+    console.log('🔄 Syncing leave requests...');
+
+    let hasMore = true;
+    let startCursor = undefined;
+    let updatedCount = 0;
+    let skippedCount = 0;
+    let errorCount = 0;
+
+    while (hasMore) {
+      const response = await this.apiCallWithRetry(async () => {
+        return await this.notion.databases.query({
+          database_id: this.leaveRequestsDbId,
+          start_cursor: startCursor,
+        });
+      });
+
+      for (const page of response.results) {
+        const pageId = page.id;
+        const properties = page.properties;
+
+        // Extract ID number from leave request
+        let requestId = null;
+        const idPropertyNames = ['رقم الهوية', 'ID Number', 'رقم'];
+
+        for (const propName of idPropertyNames) {
+          if (properties[propName]) {
+            const propType = properties[propName].type;
+
+            if (propType === 'number') {
+              requestId = this.extractPropertyValue(properties, propName, 'number');
+            } else if (propType === 'rich_text') {
+              requestId = this.extractPropertyValue(properties, propName, 'rich_text');
+            }
+
+            if (requestId) {
+              break;
+            }
+          }
+        }
+
+        const normalizedRequestId = NotionSync.normalizeIdNumber(requestId);
+
+        if (!normalizedRequestId) {
+          console.log(`  ⚠️  Skipping request ${pageId}: No valid ID number`);
+          skippedCount++;
+          continue;
+        }
+
+        // Check if we need to update this record
+        const updates = {};
+
+        // 1. Check employee relation
+        let employeeRelation = null;
+        let relationPropName = null;
+        const relationPropertyNames = ['اسم الموظف', 'Employee Name', 'الموظف'];
+
+        for (const propName of relationPropertyNames) {
+          if (properties[propName]) {
+            employeeRelation = this.extractPropertyValue(properties, propName, 'relation');
+            relationPropName = propName;
+            break;
+          }
+        }
+
+        if (this.idToPageMap.has(normalizedRequestId)) {
+          const employeePageId = this.idToPageMap.get(normalizedRequestId);
+
+          // Check if relation needs update
+          const existingRelationIds = (employeeRelation || []).map(r => r.id);
+          
+          if (!existingRelationIds.includes(employeePageId)) {
+            updates[relationPropName] = {
+              relation: [{ id: employeePageId }],
+            };
+          }
+        }
+
+        // 2. Check status
+        let statusValue = null;
+        let statusPropName = null;
+        const statusPropertyNames = ['حالة الطلب', 'Status', 'الحالة'];
+
+        for (const propName of statusPropertyNames) {
+          if (properties[propName]) {
+            const propType = properties[propName].type;
+
+            if (propType === 'select') {
+              statusValue = this.extractPropertyValue(properties, propName, 'select');
+            } else if (propType === 'status') {
+              statusValue = this.extractPropertyValue(properties, propName, 'status');
+            }
+
+            statusPropName = propName;
+            break;
+          }
+        }
+
+        if (statusPropName && !statusValue) {
+          const propType = properties[statusPropName].type;
+
+          if (propType === 'select') {
+            updates[statusPropName] = {
+              select: { name: 'قيد الانتظار' },
+            };
+          } else if (propType === 'status') {
+            updates[statusPropName] = {
+              status: { name: 'قيد الانتظار' },
+            };
+          }
+        }
+
+        // Apply updates if any
+        if (Object.keys(updates).length > 0) {
+          try {
+            await this.apiCallWithRetry(async () => {
+              return await this.notion.pages.update({
+                page_id: pageId,
+                properties: updates,
+              });
+            });
+
+            const updateDesc = [];
+            if (relationPropName in updates) {
+              updateDesc.push(`linked to employee (ID: ${normalizedRequestId})`);
+            }
+            if (statusPropName in updates) {
+              updateDesc.push("status set to 'قيد الانتظار'");
+            }
+
+            console.log(`  ✓ Updated request ${pageId}: ${updateDesc.join(', ')}`);
+            updatedCount++;
+
+            // Small delay to avoid rate limiting
+            await this.sleep(300);
+
+          } catch (error) {
+            console.log(`  ❌ Error updating ${pageId}: ${error.message}`);
+            errorCount++;
+          }
+        } else {
+          skippedCount++;
+        }
+      }
+
+      hasMore = response.has_more;
+      startCursor = response.next_cursor;
+    }
+
+    console.log(`\n📊 Sync Summary:`);
+    console.log(`  ✅ Updated: ${updatedCount}`);
+    console.log(`  ⏭️  Skipped: ${skippedCount}`);
+    console.log(`  ❌ Errors: ${errorCount}`);
+  }
+
+  /**
+   * Execute the full sync process
+   */
+  async run() {
+    console.log('='.repeat(60));
+    console.log('🚀 Starting Notion Sync Process');
+    console.log('='.repeat(60) + '\n');
+
+    try {
+      await this.buildEmployeeIndex();
+      await this.syncLeaveRequests();
+
+      console.log('\n' + '='.repeat(60));
+      console.log('✅ Sync completed successfully!');
+      console.log('='.repeat(60));
+
+    } catch (error) {
+      console.log(`\n❌ Fatal error: ${error.message}`);
+      throw error;
+    }
+  }
+}
+
+/**
+ * Main entry point
+ */
+async function main() {
+  // Load configuration from environment variables
+  const NOTION_API_KEY = process.env.NOTION_API_KEY;
+  const EMPLOYEES_DB_ID = process.env.EMPLOYEES_DB_ID;
+  const LEAVE_REQUESTS_DB_ID = process.env.LEAVE_REQUESTS_DB_ID;
+
+  // Validate configuration
+  if (!NOTION_API_KEY || !EMPLOYEES_DB_ID || !LEAVE_REQUESTS_DB_ID) {
+    console.log('❌ Error: Missing required environment variables!');
+    console.log('\nPlease set the following environment variables:');
+    console.log('  - NOTION_API_KEY: Your Notion integration API key');
+    console.log('  - EMPLOYEES_DB_ID: Database ID for employees table');
+    console.log('  - LEAVE_REQUESTS_DB_ID: Database ID for leave requests table');
+    console.log('\nExample (Linux/Mac):');
+    console.log("  export NOTION_API_KEY='secret_...'");
+    console.log("  export EMPLOYEES_DB_ID='...'");
+    console.log("  export LEAVE_REQUESTS_DB_ID='...'");
+    console.log('\nExample (Windows PowerShell):');
+    console.log('  $env:NOTION_API_KEY="secret_..."');
+    console.log('  $env:EMPLOYEES_DB_ID="..."');
+    console.log('  $env:LEAVE_REQUESTS_DB_ID="..."');
+    process.exit(1);
+  }
+
+  // Run the sync
+  const sync = new NotionSync(
+    NOTION_API_KEY,
+    EMPLOYEES_DB_ID,
+    LEAVE_REQUESTS_DB_ID
+  );
+
+  try {
+    await sync.run();
+    process.exit(0);
+  } catch (error) {
+    console.error(error);
+    process.exit(1);
+  }
+}
+
+// Run if called directly
+if (require.main === module) {
+  main();
+}
+
+module.exports = { NotionSync };

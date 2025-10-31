@@ -1,48 +1,42 @@
-// link-leaves.js
-// سكربت لربط طلبات الإجازة بجدول الموظفين وتعيين حالة الطلب لقيد الانتظار عند الحاجة
+// sync.js
+// يربط طلبات الإجازة بجدول الموظفين + يعيّن "قيد الانتظار" إذا الحالة فاضية
+// ويكتشف اسم عمود الـRelation تلقائيًا لتفادي أخطاء اختلاف الأسماء
 
 import { Client } from "@notionhq/client";
 
-// ====== الإعدادات العامة ======
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
-// IDs من Secrets أو متغيرات البيئة
+// ==== بيئة التشغيل ====
 const EMPLOYEES_DB_ID = process.env.DATABASE_ID_EMPLOYEES;
 const LEAVE_DB_ID = process.env.DATABASE_ID_LEAVE_REQUESTS;
 
-// أسماء الأعمدة في Notion (تأكد تطابقها 100%)
-const EMPLOYEE_ID_PROP = "رقم الهوية"; // موجود في الجدولين
-const EMPLOYEE_REL_PROP = "اسم الموظف"; // عمود Relation داخل جدول الإجازات
-const STATUS_PROP = "حالة الطلب";       // Status أو Select داخل جدول الإجازات
+// أسماء الحقول "المفضلة" (إن وجدت)، لكن سنحاول اكتشافها تلقائيًا لو مفقودة
+const PREFERRED_EMPLOYEE_ID_PROP = "رقم الهوية";   // في الجدولين
+const PREFERRED_STATUS_PROP = "حالة الطلب";        // في الإجازات
 const PENDING_STATUS_VALUE = "قيد الانتظار";
 
-// ====== أدوات مساعدة ======
-// تحويل الأرقام العربية/الهندية إلى إنجليزية
+// ==== أدوات مساعدة ====
+// تحويل أرقام عربية->إنجليزية وتوحيد رقم الهوية
 const ARABIC_DIGITS = /[٠-٩]/g;
-const ARABIC_TO_LATIN = {
-  "٠":"0","١":"1","٢":"2","٣":"3","٤":"4",
-  "٥":"5","٦":"6","٧":"7","٨":"8","٩":"9"
-};
+const ARABIC_TO_LATIN = { "٠":"0","١":"1","٢":"2","٣":"3","٤":"4","٥":"5","٦":"6","٧":"7","٨":"8","٩":"9" };
 
-// توحيد رقم الهوية كنص أرقام فقط
 function normalizeCivilId(value) {
   if (value === null || value === undefined) return null;
   const s = String(value)
-    .replace(ARABIC_DIGITS, d => ARABIC_TO_LATIN[d])
+    .replace(ARABIC_DIGITS, (d) => ARABIC_TO_LATIN[d])
     .replace(/[^\d]/g, "")
     .trim();
   return s.length ? s : null;
 }
 
-// محاولة مع إعادة المحاولة عند rate limit
 async function withRetry(fn, retries = 3) {
-  let lastErr;
+  let err;
   for (let i = 0; i < retries; i++) {
     try { return await fn(); }
     catch (e) {
-      lastErr = e;
-      const isRate = e?.status === 429 || e?.body?.code === "rate_limited";
-      if (isRate && i < retries - 1) {
+      err = e;
+      const rate = e?.status === 429 || e?.body?.code === "rate_limited";
+      if (rate && i < retries - 1) {
         const wait = Math.min(2000 * (i + 1), 8000);
         await new Promise(r => setTimeout(r, wait));
         continue;
@@ -50,10 +44,9 @@ async function withRetry(fn, retries = 3) {
       if (i < retries - 1) continue;
     }
   }
-  throw lastErr;
+  throw err;
 }
 
-// قراءة رقم الهوية من أي نوع شائع في Notion
 function getCivilIdFromProperty(prop) {
   if (!prop) return null;
   switch (prop.type) {
@@ -68,9 +61,9 @@ function getCivilIdFromProperty(prop) {
     case "rollup":
       if (prop.rollup.array?.length) {
         const v = prop.rollup.array[0];
-        if (v.type === "title")      return normalizeCivilId(v.title?.[0]?.plain_text);
-        if (v.type === "rich_text")  return normalizeCivilId(v.rich_text?.[0]?.plain_text);
-        if (v.type === "number")     return normalizeCivilId(v.number);
+        if (v.type === "title")     return normalizeCivilId(v.title?.[0]?.plain_text);
+        if (v.type === "rich_text") return normalizeCivilId(v.rich_text?.[0]?.plain_text);
+        if (v.type === "number")    return normalizeCivilId(v.number);
       }
       if (prop.rollup.type === "number") return normalizeCivilId(prop.rollup.number);
       return null;
@@ -78,7 +71,6 @@ function getCivilIdFromProperty(prop) {
   }
 }
 
-// هل حالة الطلب فاضية؟
 function isStatusEmpty(prop) {
   if (!prop) return true;
   if (prop.type === "status") return !prop.status;
@@ -86,21 +78,82 @@ function isStatusEmpty(prop) {
   return true;
 }
 
-// إعداد تحديث الحالة لقيمة "قيد الانتظار" حسب نوع الحقل
 function buildPendingStatusUpdate(statusProp) {
   if (!statusProp) return {};
   if (statusProp.type === "status") {
-    return { [STATUS_PROP]: { status: { name: PENDING_STATUS_VALUE } } };
+    return { [statusProp.name]: { status: { name: PENDING_STATUS_VALUE } } };
   }
   if (statusProp.type === "select") {
-    return { [STATUS_PROP]: { select: { name: PENDING_STATUS_VALUE } } };
+    return { [statusProp.name]: { select: { name: PENDING_STATUS_VALUE } } };
   }
   return {};
 }
 
-// ====== منطق العمل ======
+// ==== اكتشاف أسماء الأعمدة تلقائيًا ====
+// يرجع أسماء الحقول الفعلية في قاعدة الإجازات: relation -> employees, status, employeeId
+async function detectLeaveSchema() {
+  const leaveDb = await withRetry(() => notion.databases.retrieve({ database_id: LEAVE_DB_ID }));
+  const empDb  = await withRetry(() => notion.databases.retrieve({ database_id: EMPLOYEES_DB_ID }));
+
+  const leaveProps = leaveDb.properties || {};
+  const detected = {
+    relationProp: null,     // عمود Relation باتجاه Employees
+    statusProp: null,       // أول Status/Select (أو المفضّل إن وجد)
+    employeeIdProp: null,   // عمود رقم الهوية في جدول الإجازات
+  };
+
+  // 1) التقط الـRelation المرتبط بقاعدة Employees
+  for (const [name, prop] of Object.entries(leaveProps)) {
+    if (prop.type === "relation" && prop.relation?.database_id === EMPLOYEES_DB_ID) {
+      detected.relationProp = { name, ...prop };
+      break;
+    }
+  }
+
+  // 2) حالة الطلب: فضّل الاسم المفضل إن وجد، وإلا خذ أول status/select
+  let candidateStatus = null;
+  for (const [name, prop] of Object.entries(leaveProps)) {
+    if (name === PREFERRED_STATUS_PROP && (prop.type === "status" || prop.type === "select")) {
+      detected.statusProp = { name, ...prop };
+      break;
+    }
+    if (!candidateStatus && (prop.type === "status" || prop.type === "select")) {
+      candidateStatus = { name, ...prop };
+    }
+  }
+  if (!detected.statusProp && candidateStatus) detected.statusProp = candidateStatus;
+
+  // 3) عمود رقم الهوية في الإجازات (يفضّل الاسم المعلن)
+  let candidateId = null;
+  for (const [name, prop] of Object.entries(leaveProps)) {
+    if (name === PREFERRED_EMPLOYEE_ID_PROP) {
+      detected.employeeIdProp = { name, ...prop };
+      break;
+    }
+    if (!candidateId && ["rich_text","title","number","phone_number","formula","rollup"].includes(prop.type)) {
+      candidateId = { name, ...prop };
+    }
+  }
+  if (!detected.employeeIdProp && candidateId) detected.employeeIdProp = candidateId;
+
+  // لوق تعريفي يساعدك لو اختلفت المسميات
+  console.log("Detected in Leave DB ->",
+    "relation:", detected.relationProp?.name || "NOT FOUND",
+    "| status:", detected.statusProp?.name || "NOT FOUND",
+    "| employeeId:", detected.employeeIdProp?.name || "NOT FOUND"
+  );
+
+  if (!detected.relationProp) {
+    throw new Error("لم أجد عمود Relation يربط بقاعدة الموظفين داخل جدول الإجازات. تأكد أن هناك Relation يشير لقاعدة Employees.");
+  }
+  if (!detected.employeeIdProp) {
+    throw new Error("لم أجد عمودًا مناسبًا لرقم الهوية في جدول الإجازات.");
+  }
+  return detected;
+}
+
 // ابنِ فهرس الموظفين: رقم الهوية -> page_id
-async function buildEmployeeIndex() {
+async function buildEmployeeIndex(employeeIdPropName) {
   const index = {};
   let cursor;
 
@@ -114,7 +167,7 @@ async function buildEmployeeIndex() {
     );
 
     for (const row of res.results) {
-      const idProp = row.properties[EMPLOYEE_ID_PROP];
+      const idProp = row.properties[employeeIdPropName] || row.properties[PREFERRED_EMPLOYEE_ID_PROP];
       const civilId = getCivilIdFromProperty(idProp);
       if (civilId) index[civilId] = row.id;
     }
@@ -125,30 +178,35 @@ async function buildEmployeeIndex() {
   return index;
 }
 
-// أصلح طلبات الإجازة: اربط الموظف وعيّن الحالة عند الحاجة
-async function fixLeaveRequests(employeeIndex) {
+// أصلح طلبات الإجازة
+async function fixLeaveRequests(schema, employeeIndex) {
   let cursor;
 
+  // لاحظ: نستخدم أسماء الحقول المكتشفة
+  const REL = schema.relationProp.name;
+  const EMP_ID = schema.employeeIdProp.name;
+
   // فلتر: (العلاقة فاضية) OR (الحالة فاضية) + وجود رقم هوية
-  const baseFilter = {
+  const filter = {
     and: [
       {
         or: [
-          { property: EMPLOYEE_REL_PROP, relation: { is_empty: true } },
-          { property: STATUS_PROP, status: { is_empty: true } },
-          { property: STATUS_PROP, select: { is_empty: true } }
-        ]
+          { property: REL, relation: { is_empty: true } },
+          ...(schema.statusProp?.type === "status" ? [{ property: schema.statusProp.name, status: { is_empty: true } }] : []),
+          ...(schema.statusProp?.type === "select" ? [{ property: schema.statusProp.name, select: { is_empty: true } }] : []),
+        ],
       },
       {
         or: [
-          { property: EMPLOYEE_ID_PROP, rich_text: { is_not_empty: true } },
-          { property: EMPLOYEE_ID_PROP, number: { is_not_empty: true } },
-          { property: EMPLOYEE_ID_PROP, phone_number: { is_not_empty: true } },
-          { property: EMPLOYEE_ID_PROP, formula: { string: { is_not_empty: true } } },
-          { property: EMPLOYEE_ID_PROP, formula: { number: { is_not_empty: true } } }
-        ]
-      }
-    ]
+          { property: EMP_ID, rich_text: { is_not_empty: true } },
+          { property: EMP_ID, number: { is_not_empty: true } },
+          { property: EMP_ID, phone_number: { is_not_empty: true } },
+          { property: EMP_ID, formula: { string: { is_not_empty: true } } },
+          { property: EMP_ID, formula: { number: { is_not_empty: true } } },
+          { property: EMP_ID, rollup: { any: { rich_text: { is_not_empty: true } } } },
+        ],
+      },
+    ],
   };
 
   do {
@@ -157,61 +215,50 @@ async function fixLeaveRequests(employeeIndex) {
         database_id: LEAVE_DB_ID,
         start_cursor: cursor,
         page_size: 100,
-        filter: baseFilter
+        filter,
       })
     );
 
     for (const row of res.results) {
       const leavePageId = row.id;
 
-      // خصائص سنستخدمها
-      const relProp = row.properties[EMPLOYEE_REL_PROP];
-      const statusProp = row.properties[STATUS_PROP];
-      const idProp = row.properties[EMPLOYEE_ID_PROP];
+      const relProp = row.properties[REL];
+      const statusProp = schema.statusProp ? row.properties[schema.statusProp.name] : null;
+      const idProp = row.properties[EMP_ID];
 
-      const alreadyLinked =
-        relProp?.type === "relation" && Array.isArray(relProp.relation) && relProp.relation.length > 0;
+      const needLink = !(relProp?.type === "relation" && relProp.relation?.length > 0);
+      const needPending = schema.statusProp ? isStatusEmpty(statusProp) : false;
 
-      const needLink = !alreadyLinked;
-      const needPending = isStatusEmpty(statusProp);
-
-      // لا شيء لعمله
       if (!needLink && !needPending) continue;
 
-      // جهّز التحديث
-      const propertiesUpdate = {};
+      const props = {};
 
-      // 1) اربط الطلب بموظف لو العلاقة فاضية
+      // اربط الموظف
       if (needLink) {
         const civilId = getCivilIdFromProperty(idProp);
         if (civilId) {
           const employeePageId = employeeIndex[civilId];
           if (employeePageId) {
-            propertiesUpdate[EMPLOYEE_REL_PROP] = { relation: [{ id: employeePageId }] };
+            props[REL] = { relation: [{ id: employeePageId }] };
           } else {
-            console.log("No employee match for", civilId, "in leave", leavePageId);
+            console.log("No employee match for", civilId, "-> leave", leavePageId);
           }
         } else {
-          console.log("Leave request", leavePageId, "has no civilId");
+          console.log("Leave has no civilId:", leavePageId);
         }
       }
 
-      // 2) عيّن الحالة لقيد الانتظار إذا فاضية
+      // اضبط الحالة "قيد الانتظار"
       if (needPending) {
-        Object.assign(propertiesUpdate, buildPendingStatusUpdate(statusProp));
+        Object.assign(props, buildPendingStatusUpdate(schema.statusProp));
       }
 
-      if (Object.keys(propertiesUpdate).length) {
-        await withRetry(() =>
-          notion.pages.update({
-            page_id: leavePageId,
-            properties: propertiesUpdate
-          })
-        );
+      if (Object.keys(props).length) {
+        await withRetry(() => notion.pages.update({ page_id: leavePageId, properties: props }));
         console.log(
-          `Updated ${leavePageId}:` +
-          (needLink ? " linked relation;" : "") +
-          (needPending ? " set status=قيد الانتظار;" : "")
+          `Updated ${leavePageId}:`
+          + (needLink ? " linked;" : "")
+          + (needPending ? " status=قيد الانتظار;" : "")
         );
       }
     }
@@ -220,23 +267,27 @@ async function fixLeaveRequests(employeeIndex) {
   } while (cursor);
 }
 
-// ====== التشغيل ======
+// ===== التشغيل =====
 async function main() {
   if (!process.env.NOTION_TOKEN || !EMPLOYEES_DB_ID || !LEAVE_DB_ID) {
     throw new Error("Missing NOTION_TOKEN or database IDs env vars.");
   }
 
-  console.log("Building employee index...");
-  const employeeIndex = await buildEmployeeIndex();
+  console.log("Building schema…");
+  const schema = await detectLeaveSchema(); // ← يكتشف أسماء الأعمدة الحقيقية
+
+  console.log("Building employee index…");
+  const employeeIndex = await buildEmployeeIndex(PREFERRED_EMPLOYEE_ID_PROP);
+
   console.log("Employees indexed:", Object.keys(employeeIndex).length);
 
-  console.log("Fixing leave requests...");
-  await fixLeaveRequests(employeeIndex);
+  console.log("Fixing leave requests…");
+  await fixLeaveRequests(schema, employeeIndex);
 
   console.log("Done ✅");
 }
 
-main().catch(err => {
+main().catch((err) => {
   console.error("ERROR:", err?.message || err);
   if (err?.body) console.error(err.body);
   process.exit(1);

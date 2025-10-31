@@ -1,453 +1,299 @@
-#!/usr/bin/env node
-/**
- * Notion Employee-Leave Request Sync Script (JavaScript)
- * ======================================================
- * This script syncs employee data with leave requests in Notion:
- * - Links leave requests to employees by matching ID numbers
- * - Sets default status for empty leave request statuses
- * - Handles Arabic/Hindi numerals conversion
- * - Protects against Notion API rate limits
- */
-
 const { Client } = require('@notionhq/client');
 
-/**
- * NotionSync class handles syncing between Notion databases
- */
-class NotionSync {
-  /**
-   * Initialize the Notion sync client
-   * @param {string} apiKey - Notion integration API key
-   * @param {string} employeesDbId - Database ID for employees table
-   * @param {string} leaveRequestsDbId - Database ID for leave requests table
-   */
-  constructor(apiKey, employeesDbId, leaveRequestsDbId) {
-    this.notion = new Client({ auth: apiKey });
-    this.employeesDbId = employeesDbId;
-    this.leaveRequestsDbId = leaveRequestsDbId;
-    this.idToPageMap = new Map();
+// تهيئة عميل Notion
+const notion = new Client({
+  auth: process.env.NOTION_TOKEN,
+});
+
+// معرفات قواعد البيانات
+const EMPLOYEES_DB_ID = process.env.EMPLOYEES_DB_ID; // قاعدة بيانات الموظفين
+const LEAVE_REQUESTS_DB_ID = process.env.LEAVE_REQUESTS_DB_ID; // قاعدة بيانات طلبات الإجازة
+
+// تحويل الأرقام العربية والهندية إلى أرقام إنجليزية
+function normalizeNumber(str) {
+  if (!str) return '';
+  
+  const arabicNumbers = '٠١٢٣٤٥٦٧٨٩';
+  const hindiNumbers = '۰۱۲۳۴۵۶۷۸۹';
+  const englishNumbers = '0123456789';
+  
+  let result = String(str);
+  
+  // تحويل الأرقام العربية
+  for (let i = 0; i < arabicNumbers.length; i++) {
+    result = result.replace(new RegExp(arabicNumbers[i], 'g'), englishNumbers[i]);
   }
-
-  /**
-   * Normalize ID numbers by converting Arabic/Hindi numerals to Western numerals
-   * @param {any} idValue - The ID value (can be string, number, or null)
-   * @returns {string|null} Normalized ID as string, or null if invalid
-   */
-  static normalizeIdNumber(idValue) {
-    if (!idValue && idValue !== 0) {
-      return null;
-    }
-
-    // Convert to string first
-    let idStr = String(idValue).trim();
-
-    if (!idStr) {
-      return null;
-    }
-
-    // Arabic-Indic (Eastern Arabic) numerals: ٠١٢٣٤٥٦٧٨٩
-    const arabicNumerals = '٠١٢٣٤٥٦٧٨٩';
-    const westernNumerals = '0123456789';
-
-    // Hindi numerals: ०१२३४५६७८९
-    const hindiNumerals = '०१२३४५६७८९';
-
-    // Replace Arabic numerals
-    for (let i = 0; i < arabicNumerals.length; i++) {
-      idStr = idStr.replace(new RegExp(arabicNumerals[i], 'g'), westernNumerals[i]);
-    }
-
-    // Replace Hindi numerals
-    for (let i = 0; i < hindiNumerals.length; i++) {
-      idStr = idStr.replace(new RegExp(hindiNumerals[i], 'g'), westernNumerals[i]);
-    }
-
-    // Remove any non-numeric characters
-    const normalized = idStr.replace(/\D/g, '');
-
-    return normalized || null;
+  
+  // تحويل الأرقام الهندية
+  for (let i = 0; i < hindiNumbers.length; i++) {
+    result = result.replace(new RegExp(hindiNumbers[i], 'g'), englishNumbers[i]);
   }
+  
+  return result.trim();
+}
 
-  /**
-   * Execute Notion API call with automatic retry on rate limit (429 error)
-   * @param {Function} apiCall - The API function to call
-   * @param {number} maxRetries - Maximum number of retry attempts
-   * @returns {Promise} The result of the API call
-   */
-  async apiCallWithRetry(apiCall, maxRetries = 5) {
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
-      try {
-        return await apiCall();
-      } catch (error) {
-        const isRateLimit = 
-          error.code === 'rate_limited' || 
-          error.status === 429 ||
-          (error.message && error.message.includes('rate_limited'));
-
-        if (isRateLimit && attempt < maxRetries - 1) {
-          // Exponential backoff: 1, 2, 4, 8, 16 seconds
-          const waitTime = Math.pow(2, attempt);
-          console.log(`⚠️  Rate limit hit. Waiting ${waitTime} seconds before retry ${attempt + 1}/${maxRetries}...`);
-          await this.sleep(waitTime * 1000);
-        } else if (isRateLimit) {
-          console.log(`❌ Rate limit exceeded after ${maxRetries} attempts`);
-          throw error;
-        } else {
-          throw error;
+// استخراج رقم الهوية من خصائص الصفحة
+function extractIdNumber(properties) {
+  // جرب أسماء مختلفة محتملة للحقل
+  const possibleFields = ['رقم الهوية', 'رقم_الهوية', 'ID Number', 'ID', 'الرقم'];
+  
+  for (const fieldName of possibleFields) {
+    if (properties[fieldName]) {
+      const prop = properties[fieldName];
+      
+      // إذا كان الحقل من نوع number
+      if (prop.type === 'number') {
+        return prop.number ? String(prop.number) : null;
+      }
+      
+      // إذا كان الحقل من نوع title
+      if (prop.type === 'title' && prop.title.length > 0) {
+        return prop.title[0].plain_text;
+      }
+      
+      // إذا كان الحقل من نوع rich_text
+      if (prop.type === 'rich_text' && prop.rich_text.length > 0) {
+        return prop.rich_text[0].plain_text;
+      }
+      
+      // إذا كان الحقل من نوع formula
+      if (prop.type === 'formula') {
+        if (prop.formula.type === 'string') {
+          return prop.formula.string;
+        } else if (prop.formula.type === 'number') {
+          return String(prop.formula.number);
         }
       }
     }
   }
+  
+  return null;
+}
 
-  /**
-   * Sleep for specified milliseconds
-   * @param {number} ms - Milliseconds to sleep
-   * @returns {Promise}
-   */
-  sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
-
-  /**
-   * Extract value from Notion property safely
-   * @param {object} properties - The properties object from a Notion page
-   * @param {string} propertyName - Name of the property to extract
-   * @param {string} propertyType - Expected type
-   * @returns {any} The extracted value or null
-   */
-  extractPropertyValue(properties, propertyName, propertyType) {
-    if (!properties[propertyName]) {
-      return null;
-    }
-
-    const prop = properties[propertyName];
-
-    try {
-      switch (propertyType) {
-        case 'title':
-          return prop.title?.[0]?.plain_text || '';
-        
-        case 'rich_text':
-          return prop.rich_text?.[0]?.plain_text || '';
-        
-        case 'number':
-          return prop.number;
-        
-        case 'select':
-          return prop.select?.name || null;
-        
-        case 'status':
-          return prop.status?.name || null;
-        
-        case 'relation':
-          return prop.relation || [];
-        
-        default:
-          return null;
+// قراءة جميع الموظفين وبناء فهرس
+async function fetchEmployees() {
+  console.log('📖 جاري قراءة قاعدة بيانات الموظفين...');
+  
+  const employeesMap = new Map();
+  let hasMore = true;
+  let cursor = undefined;
+  
+  while (hasMore) {
+    const response = await notion.databases.query({
+      database_id: EMPLOYEES_DB_ID,
+      start_cursor: cursor,
+      page_size: 100,
+    });
+    
+    for (const page of response.results) {
+      const idNumber = extractIdNumber(page.properties);
+      if (idNumber) {
+        const normalizedId = normalizeNumber(idNumber);
+        employeesMap.set(normalizedId, page.id);
+        console.log(`✅ تم إضافة موظف: رقم الهوية ${normalizedId}`);
       }
-    } catch (error) {
-      return null;
+    }
+    
+    hasMore = response.has_more;
+    cursor = response.next_cursor;
+  }
+  
+  console.log(`📊 تم العثور على ${employeesMap.size} موظف في قاعدة البيانات`);
+  return employeesMap;
+}
+
+// قراءة جميع طلبات الإجازة
+async function fetchLeaveRequests() {
+  console.log('📖 جاري قراءة قاعدة بيانات طلبات الإجازة...');
+  
+  const requests = [];
+  let hasMore = true;
+  let cursor = undefined;
+  
+  while (hasMore) {
+    const response = await notion.databases.query({
+      database_id: LEAVE_REQUESTS_DB_ID,
+      start_cursor: cursor,
+      page_size: 100,
+    });
+    
+    requests.push(...response.results);
+    hasMore = response.has_more;
+    cursor = response.next_cursor;
+  }
+  
+  console.log(`📊 تم العثور على ${requests.length} طلب إجازة`);
+  return requests;
+}
+
+// تحديث طلب الإجازة
+async function updateLeaveRequest(requestId, employeePageId, needsStatusUpdate) {
+  const updateData = {
+    page_id: requestId,
+    properties: {},
+  };
+  
+  // تحديث علاقة الموظف
+  if (employeePageId) {
+    // جرب أسماء مختلفة محتملة لحقل العلاقة
+    const possibleRelationFields = ['اسم الموظف', 'الموظف', 'Employee', 'Name'];
+    
+    for (const fieldName of possibleRelationFields) {
+      updateData.properties[fieldName] = {
+        relation: [{ id: employeePageId }],
+      };
     }
   }
-
-  /**
-   * Build an index mapping ID numbers to employee page IDs
-   * Reads all employees from the employees database
-   */
-  async buildEmployeeIndex() {
-    console.log('🔍 Building employee index...');
-
-    let hasMore = true;
-    let startCursor = undefined;
-    let employeeCount = 0;
-
-    while (hasMore) {
-      const response = await this.apiCallWithRetry(async () => {
-        return await this.notion.databases.query({
-          database_id: this.employeesDbId,
-          start_cursor: startCursor,
-        });
-      });
-
-      for (const page of response.results) {
-        const pageId = page.id;
-        const properties = page.properties;
-
-        // Try to get ID number from different possible property names and types
-        let idNumber = null;
-
-        // Try common property names
-        const idPropertyNames = ['رقم الهوية', 'ID Number', 'رقم'];
-        
-        for (const propName of idPropertyNames) {
-          if (properties[propName]) {
-            const propType = properties[propName].type;
-            
-            if (propType === 'number') {
-              idNumber = this.extractPropertyValue(properties, propName, 'number');
-            } else if (propType === 'rich_text') {
-              idNumber = this.extractPropertyValue(properties, propName, 'rich_text');
-            }
-
-            if (idNumber) {
-              break;
-            }
-          }
-        }
-
-        // Normalize the ID
-        const normalizedId = NotionSync.normalizeIdNumber(idNumber);
-
-        if (normalizedId) {
-          this.idToPageMap.set(normalizedId, pageId);
-          employeeCount++;
-
-          // Get employee name for logging
-          const employeeName = 
-            this.extractPropertyValue(properties, 'اسم الموظف', 'title') ||
-            this.extractPropertyValue(properties, 'Name', 'title') ||
-            'Unknown';
-
-          console.log(`  ✓ ${employeeName}: ${normalizedId} → ${pageId}`);
-        }
-      }
-
-      hasMore = response.has_more;
-      startCursor = response.next_cursor;
+  
+  // تحديث حالة الطلب إذا كانت فارغة
+  if (needsStatusUpdate) {
+    // جرب أسماء مختلفة محتملة لحقل الحالة
+    const possibleStatusFields = ['حالة الطلب', 'الحالة', 'Status', 'State'];
+    
+    for (const fieldName of possibleStatusFields) {
+      updateData.properties[fieldName] = {
+        select: { name: 'قيد الانتظار' },
+      };
     }
-
-    console.log(`✅ Indexed ${employeeCount} employees\n`);
   }
+  
+  try {
+    await notion.pages.update(updateData);
+    console.log(`✅ تم تحديث طلب الإجازة: ${requestId}`);
+    return true;
+  } catch (error) {
+    console.error(`❌ فشل تحديث طلب الإجازة ${requestId}:`, error.message);
+    return false;
+  }
+}
 
-  /**
-   * Sync leave requests with employee data
-   * - Link requests to employees by matching ID numbers
-   * - Set default status if empty
-   */
-  async syncLeaveRequests() {
-    console.log('🔄 Syncing leave requests...');
-
-    let hasMore = true;
-    let startCursor = undefined;
+// الوظيفة الرئيسية
+async function syncNotionTables() {
+  console.log('🚀 بدء عملية المزامنة...\n');
+  
+  try {
+    // قراءة جميع الموظفين
+    const employeesMap = await fetchEmployees();
+    
+    if (employeesMap.size === 0) {
+      console.log('⚠️ لم يتم العثور على أي موظفين في قاعدة البيانات');
+      return;
+    }
+    
+    // قراءة جميع طلبات الإجازة
+    const leaveRequests = await fetchLeaveRequests();
+    
+    if (leaveRequests.length === 0) {
+      console.log('⚠️ لم يتم العثور على أي طلبات إجازة');
+      return;
+    }
+    
+    console.log('\n🔄 بدء معالجة طلبات الإجازة...\n');
+    
     let updatedCount = 0;
     let skippedCount = 0;
-    let errorCount = 0;
-
-    while (hasMore) {
-      const response = await this.apiCallWithRetry(async () => {
-        return await this.notion.databases.query({
-          database_id: this.leaveRequestsDbId,
-          start_cursor: startCursor,
-        });
-      });
-
-      for (const page of response.results) {
-        const pageId = page.id;
-        const properties = page.properties;
-
-        // Extract ID number from leave request
-        let requestId = null;
-        const idPropertyNames = ['رقم الهوية', 'ID Number', 'رقم'];
-
-        for (const propName of idPropertyNames) {
-          if (properties[propName]) {
-            const propType = properties[propName].type;
-
-            if (propType === 'number') {
-              requestId = this.extractPropertyValue(properties, propName, 'number');
-            } else if (propType === 'rich_text') {
-              requestId = this.extractPropertyValue(properties, propName, 'rich_text');
-            }
-
-            if (requestId) {
+    
+    // معالجة كل طلب إجازة
+    for (const request of leaveRequests) {
+      const requestIdNumber = extractIdNumber(request.properties);
+      
+      if (!requestIdNumber) {
+        console.log(`⚠️ طلب بدون رقم هوية: ${request.id}`);
+        skippedCount++;
+        continue;
+      }
+      
+      const normalizedRequestId = normalizeNumber(requestIdNumber);
+      const employeePageId = employeesMap.get(normalizedRequestId);
+      
+      if (!employeePageId) {
+        console.log(`⚠️ لم يتم العثور على موظف برقم الهوية: ${normalizedRequestId}`);
+        skippedCount++;
+        continue;
+      }
+      
+      // التحقق من حالة الطلب
+      let needsStatusUpdate = false;
+      const statusFields = ['حالة الطلب', 'الحالة', 'Status', 'State'];
+      
+      for (const fieldName of statusFields) {
+        if (request.properties[fieldName]) {
+          const statusProp = request.properties[fieldName];
+          
+          if (statusProp.type === 'select' && !statusProp.select) {
+            needsStatusUpdate = true;
+            break;
+          }
+          
+          if (statusProp.type === 'status' && !statusProp.status) {
+            needsStatusUpdate = true;
+            break;
+          }
+        }
+      }
+      
+      // التحقق من علاقة الموظف الحالية
+      let needsRelationUpdate = true;
+      const relationFields = ['اسم الموظف', 'الموظف', 'Employee', 'Name'];
+      
+      for (const fieldName of relationFields) {
+        if (request.properties[fieldName]) {
+          const relationProp = request.properties[fieldName];
+          
+          if (relationProp.type === 'relation' && relationProp.relation.length > 0) {
+            // التحقق إذا كانت العلاقة صحيحة بالفعل
+            if (relationProp.relation[0].id === employeePageId) {
+              needsRelationUpdate = false;
               break;
             }
           }
         }
-
-        const normalizedRequestId = NotionSync.normalizeIdNumber(requestId);
-
-        if (!normalizedRequestId) {
-          console.log(`  ⚠️  Skipping request ${pageId}: No valid ID number`);
-          skippedCount++;
-          continue;
-        }
-
-        // Check if we need to update this record
-        const updates = {};
-
-        // 1. Check employee relation
-        let employeeRelation = null;
-        let relationPropName = null;
-        const relationPropertyNames = ['اسم الموظف', 'Employee Name', 'الموظف'];
-
-        for (const propName of relationPropertyNames) {
-          if (properties[propName]) {
-            employeeRelation = this.extractPropertyValue(properties, propName, 'relation');
-            relationPropName = propName;
-            break;
-          }
-        }
-
-        if (this.idToPageMap.has(normalizedRequestId)) {
-          const employeePageId = this.idToPageMap.get(normalizedRequestId);
-
-          // Check if relation needs update
-          const existingRelationIds = (employeeRelation || []).map(r => r.id);
-          
-          if (!existingRelationIds.includes(employeePageId)) {
-            updates[relationPropName] = {
-              relation: [{ id: employeePageId }],
-            };
-          }
-        }
-
-        // 2. Check status
-        let statusValue = null;
-        let statusPropName = null;
-        const statusPropertyNames = ['حالة الطلب', 'Status', 'الحالة'];
-
-        for (const propName of statusPropertyNames) {
-          if (properties[propName]) {
-            const propType = properties[propName].type;
-
-            if (propType === 'select') {
-              statusValue = this.extractPropertyValue(properties, propName, 'select');
-            } else if (propType === 'status') {
-              statusValue = this.extractPropertyValue(properties, propName, 'status');
-            }
-
-            statusPropName = propName;
-            break;
-          }
-        }
-
-        if (statusPropName && !statusValue) {
-          const propType = properties[statusPropName].type;
-
-          if (propType === 'select') {
-            updates[statusPropName] = {
-              select: { name: 'قيد الانتظار' },
-            };
-          } else if (propType === 'status') {
-            updates[statusPropName] = {
-              status: { name: 'قيد الانتظار' },
-            };
-          }
-        }
-
-        // Apply updates if any
-        if (Object.keys(updates).length > 0) {
-          try {
-            await this.apiCallWithRetry(async () => {
-              return await this.notion.pages.update({
-                page_id: pageId,
-                properties: updates,
-              });
-            });
-
-            const updateDesc = [];
-            if (relationPropName in updates) {
-              updateDesc.push(`linked to employee (ID: ${normalizedRequestId})`);
-            }
-            if (statusPropName in updates) {
-              updateDesc.push("status set to 'قيد الانتظار'");
-            }
-
-            console.log(`  ✓ Updated request ${pageId}: ${updateDesc.join(', ')}`);
-            updatedCount++;
-
-            // Small delay to avoid rate limiting
-            await this.sleep(300);
-
-          } catch (error) {
-            console.log(`  ❌ Error updating ${pageId}: ${error.message}`);
-            errorCount++;
-          }
-        } else {
-          skippedCount++;
-        }
       }
-
-      hasMore = response.has_more;
-      startCursor = response.next_cursor;
+      
+      // تحديث الطلب إذا لزم الأمر
+      if (needsRelationUpdate || needsStatusUpdate) {
+        const success = await updateLeaveRequest(
+          request.id,
+          needsRelationUpdate ? employeePageId : null,
+          needsStatusUpdate
+        );
+        
+        if (success) {
+          updatedCount++;
+          console.log(`   ✓ رقم الهوية: ${normalizedRequestId}`);
+          if (needsRelationUpdate) console.log(`   ✓ تم ربط الموظف`);
+          if (needsStatusUpdate) console.log(`   ✓ تم تعيين الحالة: قيد الانتظار`);
+        }
+      } else {
+        console.log(`✓ الطلب محدث بالفعل: ${normalizedRequestId}`);
+        skippedCount++;
+      }
     }
-
-    console.log(`\n📊 Sync Summary:`);
-    console.log(`  ✅ Updated: ${updatedCount}`);
-    console.log(`  ⏭️  Skipped: ${skippedCount}`);
-    console.log(`  ❌ Errors: ${errorCount}`);
-  }
-
-  /**
-   * Execute the full sync process
-   */
-  async run() {
-    console.log('='.repeat(60));
-    console.log('🚀 Starting Notion Sync Process');
-    console.log('='.repeat(60) + '\n');
-
-    try {
-      await this.buildEmployeeIndex();
-      await this.syncLeaveRequests();
-
-      console.log('\n' + '='.repeat(60));
-      console.log('✅ Sync completed successfully!');
-      console.log('='.repeat(60));
-
-    } catch (error) {
-      console.log(`\n❌ Fatal error: ${error.message}`);
-      throw error;
-    }
-  }
-}
-
-/**
- * Main entry point
- */
-async function main() {
-  // Load configuration from environment variables
-  const NOTION_API_KEY = process.env.NOTION_API_KEY;
-  const EMPLOYEES_DB_ID = process.env.EMPLOYEES_DB_ID;
-  const LEAVE_REQUESTS_DB_ID = process.env.LEAVE_REQUESTS_DB_ID;
-
-  // Validate configuration
-  if (!NOTION_API_KEY || !EMPLOYEES_DB_ID || !LEAVE_REQUESTS_DB_ID) {
-    console.log('❌ Error: Missing required environment variables!');
-    console.log('\nPlease set the following environment variables:');
-    console.log('  - NOTION_API_KEY: Your Notion integration API key');
-    console.log('  - EMPLOYEES_DB_ID: Database ID for employees table');
-    console.log('  - LEAVE_REQUESTS_DB_ID: Database ID for leave requests table');
-    console.log('\nExample (Linux/Mac):');
-    console.log("  export NOTION_API_KEY='secret_...'");
-    console.log("  export EMPLOYEES_DB_ID='...'");
-    console.log("  export LEAVE_REQUESTS_DB_ID='...'");
-    console.log('\nExample (Windows PowerShell):');
-    console.log('  $env:NOTION_API_KEY="secret_..."');
-    console.log('  $env:EMPLOYEES_DB_ID="..."');
-    console.log('  $env:LEAVE_REQUESTS_DB_ID="..."');
-    process.exit(1);
-  }
-
-  // Run the sync
-  const sync = new NotionSync(
-    NOTION_API_KEY,
-    EMPLOYEES_DB_ID,
-    LEAVE_REQUESTS_DB_ID
-  );
-
-  try {
-    await sync.run();
-    process.exit(0);
+    
+    // ملخص النتائج
+    console.log('\n' + '='.repeat(50));
+    console.log('📊 ملخص عملية المزامنة:');
+    console.log('='.repeat(50));
+    console.log(`✅ تم تحديث: ${updatedCount} طلب`);
+    console.log(`⏭️ تم تجاوز: ${skippedCount} طلب`);
+    console.log(`📝 الإجمالي: ${leaveRequests.length} طلب`);
+    console.log('='.repeat(50));
+    console.log('✨ انتهت عملية المزامنة بنجاح!');
+    
   } catch (error) {
-    console.error(error);
-    process.exit(1);
+    console.error('❌ حدث خطأ أثناء المزامنة:', error);
+    throw error;
   }
 }
 
-// Run if called directly
+// تشغيل المزامنة
 if (require.main === module) {
-  main();
+  syncNotionTables()
+    .then(() => process.exit(0))
+    .catch((error) => {
+      console.error('❌ فشلت عملية المزامنة:', error);
+      process.exit(1);
+    });
 }
 
-module.exports = { NotionSync };
+module.exports = { syncNotionTables };

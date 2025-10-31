@@ -4,6 +4,7 @@
   "description": "مزامنة جداول Notion - ربط الموظفين بطلبات الإجازة",
   "main": "sync-notion-tables.js",
   "scripts": {
+    "start": "node sync-notion-tables.js",
     "sync": "node sync-notion-tables.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
@@ -20,16 +21,5 @@
   },
   "engines": {
     "node": ">=14.0.0"
-  }
-}
-{
-  "name": "notion-employee-sync",
-  "version": "1.0.0",
-  "type": "module",
-  "scripts": {
-    "start": "node sync.js"
-  },
-  "dependencies": {
-    "@notionhq/client": "^2.2.15"
   }
 }

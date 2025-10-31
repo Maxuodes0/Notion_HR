@@ -1,32 +1,30 @@
 // sync.js
-// يربط طلبات الإجازة بجدول الموظفين + يعيّن "قيد الانتظار" إذا الحالة فاضية
-// ويكتشف اسم عمود الـRelation تلقائيًا لتفادي أخطاء اختلاف الأسماء
+// يربط "طلبات الاجازة" بجدول "الموظفين" حسب رقم الهوية
+// ويعيّن "حالة الطلب" إلى "قيد الانتظار" إذا كانت فاضية
 
 import { Client } from "@notionhq/client";
 
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
-// ==== بيئة التشغيل ====
+// ========= إعدادات البيئة =========
 const EMPLOYEES_DB_ID = process.env.DATABASE_ID_EMPLOYEES;
 const LEAVE_DB_ID = process.env.DATABASE_ID_LEAVE_REQUESTS;
 
-// أسماء الحقول "المفضلة" (إن وجدت)، لكن سنحاول اكتشافها تلقائيًا لو مفقودة
-const PREFERRED_EMPLOYEE_ID_PROP = "رقم الهوية";   // في الجدولين
-const PREFERRED_STATUS_PROP = "حالة الطلب";        // في الإجازات
+// أسماء الحقول كما تظهر لديك (مع بدائل شائعة احتياطًا)
+const EMP_DB_ID_PROP_CANDIDATES = ["رقم الهويه", "رقم الهوية", "الهويه رقم"];
+const LEAVE_DB_ID_PROP_CANDIDATES = ["الهويه رقم", "رقم الهوية", "رقم الهويه"];
+const RELATION_PROP_NAME = "اسم الموظف";
+const STATUS_PROP_NAME = "حالة الطلب";
 const PENDING_STATUS_VALUE = "قيد الانتظار";
 
-// ==== أدوات مساعدة ====
-// تحويل أرقام عربية->إنجليزية وتوحيد رقم الهوية
+// ========= أدوات مساعدة =========
+// أرقام عربية -> إنجليزية + إزالة أي رموز غير أرقام
 const ARABIC_DIGITS = /[٠-٩]/g;
-const ARABIC_TO_LATIN = { "٠":"0","١":"1","٢":"2","٣":"3","٤":"4","٥":"5","٦":"6","٧":"7","٨":"8","٩":"9" };
-
-function normalizeCivilId(value) {
-  if (value === null || value === undefined) return null;
-  const s = String(value)
-    .replace(ARABIC_DIGITS, (d) => ARABIC_TO_LATIN[d])
-    .replace(/[^\d]/g, "")
-    .trim();
-  return s.length ? s : null;
+const AR2EN = { "٠":"0","١":"1","٢":"2","٣":"3","٤":"4","٥":"5","٦":"6","٧":"7","٨":"8","٩":"9" };
+function normalizeCivilId(v) {
+  if (v === null || v === undefined) return null;
+  const s = String(v).replace(ARABIC_DIGITS, d => AR2EN[d]).replace(/[^\d]/g, "").trim();
+  return s || null;
 }
 
 async function withRetry(fn, retries = 3) {
@@ -47,7 +45,15 @@ async function withRetry(fn, retries = 3) {
   throw err;
 }
 
-function getCivilIdFromProperty(prop) {
+// رجّع أول خاصية موجودة من قائمة مرشحين
+function pickPropName(rowProps, candidates) {
+  for (const name of candidates) {
+    if (rowProps[name]) return name;
+  }
+  return null;
+}
+
+function readCivilIdFromProp(prop) {
   if (!prop) return null;
   switch (prop.type) {
     case "title":        return normalizeCivilId(prop.title?.[0]?.plain_text);
@@ -78,82 +84,18 @@ function isStatusEmpty(prop) {
   return true;
 }
 
-function buildPendingStatusUpdate(statusProp) {
-  if (!statusProp) return {};
-  if (statusProp.type === "status") {
-    return { [statusProp.name]: { status: { name: PENDING_STATUS_VALUE } } };
+function buildPendingStatusUpdate(statusPropType, statusPropName) {
+  if (statusPropType === "status") {
+    return { [statusPropName]: { status: { name: PENDING_STATUS_VALUE } } };
   }
-  if (statusProp.type === "select") {
-    return { [statusProp.name]: { select: { name: PENDING_STATUS_VALUE } } };
+  if (statusPropType === "select") {
+    return { [statusPropName]: { select: { name: PENDING_STATUS_VALUE } } };
   }
   return {};
 }
 
-// ==== اكتشاف أسماء الأعمدة تلقائيًا ====
-// يرجع أسماء الحقول الفعلية في قاعدة الإجازات: relation -> employees, status, employeeId
-async function detectLeaveSchema() {
-  const leaveDb = await withRetry(() => notion.databases.retrieve({ database_id: LEAVE_DB_ID }));
-  const empDb  = await withRetry(() => notion.databases.retrieve({ database_id: EMPLOYEES_DB_ID }));
-
-  const leaveProps = leaveDb.properties || {};
-  const detected = {
-    relationProp: null,     // عمود Relation باتجاه Employees
-    statusProp: null,       // أول Status/Select (أو المفضّل إن وجد)
-    employeeIdProp: null,   // عمود رقم الهوية في جدول الإجازات
-  };
-
-  // 1) التقط الـRelation المرتبط بقاعدة Employees
-  for (const [name, prop] of Object.entries(leaveProps)) {
-    if (prop.type === "relation" && prop.relation?.database_id === EMPLOYEES_DB_ID) {
-      detected.relationProp = { name, ...prop };
-      break;
-    }
-  }
-
-  // 2) حالة الطلب: فضّل الاسم المفضل إن وجد، وإلا خذ أول status/select
-  let candidateStatus = null;
-  for (const [name, prop] of Object.entries(leaveProps)) {
-    if (name === PREFERRED_STATUS_PROP && (prop.type === "status" || prop.type === "select")) {
-      detected.statusProp = { name, ...prop };
-      break;
-    }
-    if (!candidateStatus && (prop.type === "status" || prop.type === "select")) {
-      candidateStatus = { name, ...prop };
-    }
-  }
-  if (!detected.statusProp && candidateStatus) detected.statusProp = candidateStatus;
-
-  // 3) عمود رقم الهوية في الإجازات (يفضّل الاسم المعلن)
-  let candidateId = null;
-  for (const [name, prop] of Object.entries(leaveProps)) {
-    if (name === PREFERRED_EMPLOYEE_ID_PROP) {
-      detected.employeeIdProp = { name, ...prop };
-      break;
-    }
-    if (!candidateId && ["rich_text","title","number","phone_number","formula","rollup"].includes(prop.type)) {
-      candidateId = { name, ...prop };
-    }
-  }
-  if (!detected.employeeIdProp && candidateId) detected.employeeIdProp = candidateId;
-
-  // لوق تعريفي يساعدك لو اختلفت المسميات
-  console.log("Detected in Leave DB ->",
-    "relation:", detected.relationProp?.name || "NOT FOUND",
-    "| status:", detected.statusProp?.name || "NOT FOUND",
-    "| employeeId:", detected.employeeIdProp?.name || "NOT FOUND"
-  );
-
-  if (!detected.relationProp) {
-    throw new Error("لم أجد عمود Relation يربط بقاعدة الموظفين داخل جدول الإجازات. تأكد أن هناك Relation يشير لقاعدة Employees.");
-  }
-  if (!detected.employeeIdProp) {
-    throw new Error("لم أجد عمودًا مناسبًا لرقم الهوية في جدول الإجازات.");
-  }
-  return detected;
-}
-
-// ابنِ فهرس الموظفين: رقم الهوية -> page_id
-async function buildEmployeeIndex(employeeIdPropName) {
+// ========= بناء فهرس الموظفين: رقم الهوية -> page_id =========
+async function buildEmployeeIndex() {
   const index = {};
   let cursor;
 
@@ -167,8 +109,9 @@ async function buildEmployeeIndex(employeeIdPropName) {
     );
 
     for (const row of res.results) {
-      const idProp = row.properties[employeeIdPropName] || row.properties[PREFERRED_EMPLOYEE_ID_PROP];
-      const civilId = getCivilIdFromProperty(idProp);
+      const props = row.properties;
+      const empIdPropName = pickPropName(props, EMP_DB_ID_PROP_CANDIDATES);
+      const civilId = readCivilIdFromProp(props[empIdPropName]);
       if (civilId) index[civilId] = row.id;
     }
 
@@ -178,36 +121,9 @@ async function buildEmployeeIndex(employeeIdPropName) {
   return index;
 }
 
-// أصلح طلبات الإجازة
-async function fixLeaveRequests(schema, employeeIndex) {
+// ========= إصلاح طلبات الإجازة =========
+async function fixLeaveRequests(employeeIndex) {
   let cursor;
-
-  // لاحظ: نستخدم أسماء الحقول المكتشفة
-  const REL = schema.relationProp.name;
-  const EMP_ID = schema.employeeIdProp.name;
-
-  // فلتر: (العلاقة فاضية) OR (الحالة فاضية) + وجود رقم هوية
-  const filter = {
-    and: [
-      {
-        or: [
-          { property: REL, relation: { is_empty: true } },
-          ...(schema.statusProp?.type === "status" ? [{ property: schema.statusProp.name, status: { is_empty: true } }] : []),
-          ...(schema.statusProp?.type === "select" ? [{ property: schema.statusProp.name, select: { is_empty: true } }] : []),
-        ],
-      },
-      {
-        or: [
-          { property: EMP_ID, rich_text: { is_not_empty: true } },
-          { property: EMP_ID, number: { is_not_empty: true } },
-          { property: EMP_ID, phone_number: { is_not_empty: true } },
-          { property: EMP_ID, formula: { string: { is_not_empty: true } } },
-          { property: EMP_ID, formula: { number: { is_not_empty: true } } },
-          { property: EMP_ID, rollup: { any: { rich_text: { is_not_empty: true } } } },
-        ],
-      },
-    ],
-  };
 
   do {
     const res = await withRetry(() =>
@@ -215,50 +131,63 @@ async function fixLeaveRequests(schema, employeeIndex) {
         database_id: LEAVE_DB_ID,
         start_cursor: cursor,
         page_size: 100,
-        filter,
       })
     );
 
     for (const row of res.results) {
-      const leavePageId = row.id;
+      const props = row.properties;
 
-      const relProp = row.properties[REL];
-      const statusProp = schema.statusProp ? row.properties[schema.statusProp.name] : null;
-      const idProp = row.properties[EMP_ID];
+      // أسماء الأعمدة الفعلية في هذا الصف
+      const leaveIdPropName = pickPropName(props, LEAVE_DB_ID_PROP_CANDIDATES);
+      if (!leaveIdPropName) {
+        console.log("⚠️ لا أجد عمود الهوية في أحد الصفوف، أتخطاه:", row.id);
+        continue;
+      }
 
-      const needLink = !(relProp?.type === "relation" && relProp.relation?.length > 0);
-      const needPending = schema.statusProp ? isStatusEmpty(statusProp) : false;
+      const relationProp = props[RELATION_PROP_NAME];
+      const statusProp = props[STATUS_PROP_NAME];
+
+      const alreadyLinked =
+        relationProp?.type === "relation" &&
+        Array.isArray(relationProp.relation) &&
+        relationProp.relation.length > 0;
+
+      const needLink = !alreadyLinked;
+      const needPending = isStatusEmpty(statusProp);
 
       if (!needLink && !needPending) continue;
 
-      const props = {};
+      const changes = {};
 
-      // اربط الموظف
+      // 1) اربط الموظف إذا العلاقة فاضية
       if (needLink) {
-        const civilId = getCivilIdFromProperty(idProp);
+        const civilId = readCivilIdFromProp(props[leaveIdPropName]);
         if (civilId) {
-          const employeePageId = employeeIndex[civilId];
-          if (employeePageId) {
-            props[REL] = { relation: [{ id: employeePageId }] };
+          const empPage = employeeIndex[civilId];
+          if (empPage) {
+            changes[RELATION_PROP_NAME] = { relation: [{ id: empPage }] };
           } else {
-            console.log("No employee match for", civilId, "-> leave", leavePageId);
+            console.log("لا يوجد موظف مطابق للهوية:", civilId, "— صفحة الطلب:", row.id);
           }
         } else {
-          console.log("Leave has no civilId:", leavePageId);
+          console.log("رقم الهوية غير موجود/غير صالح في الطلب:", row.id);
         }
       }
 
-      // اضبط الحالة "قيد الانتظار"
+      // 2) عيّن الحالة لقيد الانتظار إذا فاضية
       if (needPending) {
-        Object.assign(props, buildPendingStatusUpdate(schema.statusProp));
+        const t = statusProp?.type || "status"; // نفترض status إن لم تتوفر المعلومة
+        Object.assign(changes, buildPendingStatusUpdate(t, STATUS_PROP_NAME));
       }
 
-      if (Object.keys(props).length) {
-        await withRetry(() => notion.pages.update({ page_id: leavePageId, properties: props }));
+      if (Object.keys(changes).length) {
+        await withRetry(() =>
+          notion.pages.update({ page_id: row.id, properties: changes })
+        );
         console.log(
-          `Updated ${leavePageId}:`
-          + (needLink ? " linked;" : "")
-          + (needPending ? " status=قيد الانتظار;" : "")
+          `✅ Updated ${row.id}:` +
+          (needLink ? " linked;" : "") +
+          (needPending ? " status=قيد الانتظار;" : "")
         );
       }
     }
@@ -267,27 +196,23 @@ async function fixLeaveRequests(schema, employeeIndex) {
   } while (cursor);
 }
 
-// ===== التشغيل =====
+// ========= التشغيل =========
 async function main() {
   if (!process.env.NOTION_TOKEN || !EMPLOYEES_DB_ID || !LEAVE_DB_ID) {
     throw new Error("Missing NOTION_TOKEN or database IDs env vars.");
   }
 
-  console.log("Building schema…");
-  const schema = await detectLeaveSchema(); // ← يكتشف أسماء الأعمدة الحقيقية
-
   console.log("Building employee index…");
-  const employeeIndex = await buildEmployeeIndex(PREFERRED_EMPLOYEE_ID_PROP);
-
+  const employeeIndex = await buildEmployeeIndex();
   console.log("Employees indexed:", Object.keys(employeeIndex).length);
 
   console.log("Fixing leave requests…");
-  await fixLeaveRequests(schema, employeeIndex);
+  await fixLeaveRequests(employeeIndex);
 
   console.log("Done ✅");
 }
 
-main().catch((err) => {
+main().catch(err => {
   console.error("ERROR:", err?.message || err);
   if (err?.body) console.error(err.body);
   process.exit(1);

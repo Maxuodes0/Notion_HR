@@ -1,12 +1,30 @@
 {
-  "name": "notion_hr",
+  "name": "notion-employee-sync",
   "version": "1.0.0",
-  "type": "module",
+  "description": "Sync employee data with leave requests in Notion - مزامنة بيانات الموظفين مع طلبات الإجازة في Notion",
   "main": "sync.js",
   "scripts": {
-    "start": "node sync.js"
+    "start": "node sync.js",
+    "sync": "node sync.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
+  "keywords": [
+    "notion",
+    "sync",
+    "employees",
+    "leave",
+    "hr",
+    "arabic",
+    "موظفين",
+    "إجازات"
+  ],
+  "author": "",
+  "license": "MIT",
   "dependencies": {
-    "@notionhq/client": "^2.2.15"
+    "@notionhq/client": "^2.2.15",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=14.0.0"
   }
 }

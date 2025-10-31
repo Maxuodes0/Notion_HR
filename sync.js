@@ -131,18 +131,41 @@ function findStatusProp(leaveDbSchema) {
   return null;
 }
 
-// اختيار "قيد الانتظار" إن وجد، وإلا أقرب خيار منطقي
-function pickPendingOption(options) {
-  if (!options || options.length === 0) return null;
-  const preferred = ['قيد الانتظار', 'Pending', 'Awaiting', 'In Progress', 'To Do', 'New'];
-  for (const want of preferred) {
-    const hit = options.find(
-      (o) => (o.name || '').trim().toLowerCase() === want.trim().toLowerCase()
-    );
-    if (hit) return hit.name;
+// --------------------------------------
+// تهيئة اسم الحالة "قيد الانتظار"
+// --------------------------------------
+function normalizeLabel(s = '') {
+  return s.replace(/\s+/g, '').trim().toLowerCase();
+}
+
+// تُرجع اسمًا صالحًا للتعيين + هل موجود مسبقاً أم لا
+function pickPendingName(kind, options) {
+  const desired = 'قيد الانتظار';
+  const desiredNorm = normalizeLabel(desired);
+
+  // 1) إذا الاسم موجود فعلاً ضمن الخيارات → رجّعه
+  const hit = (options || []).find(o => normalizeLabel(o.name) === desiredNorm);
+  if (hit) return { name: hit.name, exists: true };
+
+  if (kind === 'select') {
+    // 2) select: نقدر ننشئه مباشرة
+    return { name: desired, exists: false };
   }
-  // fallback: أول خيار
-  return options[0].name;
+
+  // 3) status: ما نقدر ننشئ خيار جديد. نختار أفضل بديل
+  const toDo = (options || []).find(o => (o.status && o.status.group === 'to_do') || o.group === 'to_do');
+  if (toDo) {
+    console.warn('⚠️ (status) لا يوجد "قيد الانتظار"؛ تم اختيار أول خيار ضمن مجموعة To-do.');
+    return { name: toDo.name, exists: true };
+  }
+
+  if ((options || []).length > 0) {
+    console.warn('⚠️ (status) لا يوجد "قيد الانتظار"؛ تم اختيار أول خيار متاح.');
+    return { name: options[0].name, exists: true };
+  }
+
+  console.warn('⚠️ (status) لا توجد أي خيارات مُعرّفة.');
+  return { name: null, exists: false };
 }
 
 // --------------------------------------
@@ -208,7 +231,7 @@ async function updateLeaveRequestSmart({
   employeePageId,     // string | null
   relationPropName,   // string | null
   statusProp,         // { name, kind, options } | null
-  setStatusToPending, // boolean
+  setStatusToPending, // boolean (متى؟ لما يكون فاضي)
 }) {
   const properties = {};
 
@@ -217,19 +240,21 @@ async function updateLeaveRequestSmart({
     properties[relationPropName] = { relation: [{ id: employeePageId }] };
   }
 
-  // Status/Select
+  // Status/Select (فقط إذا فاضي)
   if (setStatusToPending && statusProp) {
-    const pendingName = pickPendingOption(statusProp.options);
-    if (pendingName) {
+    const pick = pickPendingName(statusProp.kind, statusProp.options);
+    if (pick.name) {
       if (statusProp.kind === 'status') {
-        properties[statusProp.name] = { status: { name: pendingName } };
+        properties[statusProp.name] = { status: { name: pick.name } };
       } else {
-        properties[statusProp.name] = { select: { name: pendingName } };
+        properties[statusProp.name] = { select: { name: pick.name } };
       }
+      console.log(`   ↪︎ تعيين الحالة إلى: ${pick.name}${pick.exists ? '' : ' (تم إنشاؤه)'} (${statusProp.kind})`);
+    } else {
+      console.warn('⚠️ تعذّر تعيين الحالة: لا يوجد أي خيار صالح.');
     }
   }
 
-  // لا ترسل تحديث لو ما عندك ولا خاصية صالحة
   if (Object.keys(properties).length === 0) return false;
 
   try {
@@ -307,20 +332,21 @@ async function syncNotionTables() {
         continue;
       }
 
-      // تحديد هل يحتاج حالة؟
+      // هل نحتاج نحدّث الحالة (فقط إذا كانت فاضية)؟
       let needsStatusUpdate = false;
       if (statusProp) {
         const p = request.properties[statusProp.name];
-        if (p) {
-          if (statusProp.kind === 'status' && !p.status) needsStatusUpdate = true;
-          if (statusProp.kind === 'select' && !p.select) needsStatusUpdate = true;
-        } else {
-          // الحقل موجود في الـ DB لكنه غير ظاهر على الصفحة (نادر)
+        if (!p) {
+          // الحقل موجود في الـ DB لكنه غير ظاهر على الصفحة → اعتبره فاضي
+          needsStatusUpdate = true;
+        } else if (statusProp.kind === 'status' && !p.status) {
+          needsStatusUpdate = true;
+        } else if (statusProp.kind === 'select' && !p.select) {
           needsStatusUpdate = true;
         }
       }
 
-      // تحديد هل يحتاج ربط Relation؟
+      // هل نحتاج تحديث الربط Relation؟
       let needsRelationUpdate = !!relationPropName;
       if (relationPropName && request.properties[relationPropName]) {
         const r = request.properties[relationPropName];
@@ -342,7 +368,7 @@ async function syncNotionTables() {
           updatedCount++;
           console.log(`   ✓ رقم الهوية: ${normalizedRequestId}`);
           if (needsRelationUpdate) console.log('   ✓ تم ربط الموظف');
-          if (needsStatusUpdate) console.log('   ✓ تم تعيين الحالة');
+          if (needsStatusUpdate) console.log('   ✓ تم تعيين الحالة (إن كانت فاضية)');
         }
       } else {
         console.log(`✓ الطلب محدث بالفعل: ${normalizedRequestId}`);
@@ -375,5 +401,5 @@ if (require.main === module) {
     });
 }
 
-// للتصدير إن احتجته في اختبارات أو سكربت آخر
+// للتصدير إن احتجته
 module.exports = { syncNotionTables };

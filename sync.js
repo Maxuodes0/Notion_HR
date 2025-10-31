@@ -1,48 +1,43 @@
+// sync.js
+// يربط طلبات الإجازة بالموظفين حسب رقم الهوية
+// ويضبط حالة الطلب = "قيد الانتظار" إذا كانت فاضية
+
 import { Client } from "@notionhq/client";
 
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
+// IDs من البيئة
 const EMPLOYEES_DB_ID = process.env.DATABASE_ID_EMPLOYEES;
-const LEAVE_DB_ID = process.env.DATABASE_ID_LEAVE_REQUESTS;
+const LEAVE_DB_ID     = process.env.DATABASE_ID_LEAVE_REQUESTS;
 
-// لو ودك تجبر اسم العلاقة يدويًا (تجاوز الاكتشاف التلقائي)
-const RELATION_PROP_OVERRIDE = process.env.RELATION_PROP_OVERRIDE || null;
+// أسماء الأعمدة
+const RELATION_PROP_NAME = "اسم الموظف";           // relation داخل "طلبات الإجازة" يشير لجدول الموظفين
+const STATUS_PROP_NAME   = "حالة الطلب";           // Status أو Select
+const PENDING_VALUE      = "قيد الانتظار";
 
-// أسماء محتملة لأعمدة الهوية (حسب صورك: "الهويه رقم" في الإجازات، و"رقم الهويه" في الموظفين)
-const EMP_DB_ID_PROP_CANDIDATES   = ["رقم الهويه", "رقم الهوية", "الهويه رقم"];
-const LEAVE_DB_ID_PROP_CANDIDATES = ["الهويه رقم", "رقم الهوية", "رقم الهويه"];
+// مرشّحات أسماء رقم الهوية (عشان اختلاف الصياغة)
+const EMP_ID_CANDIDATES   = ["رقم الهويه", "رقم الهوية"];         // في جدول الموظفين
+const LEAVE_ID_CANDIDATES = ["الهويه رقم", "رقم الهويه", "رقم الهوية"]; // في جدول طلبات الإجازة
 
-// حالة الطلب
-const STATUS_PREFERRED_NAME = "حالة الطلب";
-const PENDING_STATUS_VALUE  = "قيد الانتظار";
-
+// ===== Helpers =====
 const ARABIC_DIGITS = /[٠-٩]/g;
 const AR2EN = { "٠":"0","١":"1","٢":"2","٣":"3","٤":"4","٥":"5","٦":"6","٧":"7","٨":"8","٩":"9" };
 
 function normalizeCivilId(v) {
   if (v === null || v === undefined) return null;
-  const s = String(v).replace(ARABIC_DIGITS, d => AR2EN[d]).replace(/[^\d]/g, "").trim();
+  const s = String(v)
+    .replace(ARABIC_DIGITS, d => AR2EN[d])
+    .replace(/[^\d]/g, "")
+    .trim();
   return s || null;
 }
 
-async function withRetry(fn, retries = 3) {
-  let err;
-  for (let i = 0; i < retries; i++) {
-    try { return await fn(); }
-    catch (e) {
-      err = e;
-      const rate = e?.status === 429 || e?.body?.code === "rate_limited";
-      if (rate && i < retries - 1) {
-        await new Promise(r => setTimeout(r, Math.min(2000 * (i + 1), 8000)));
-        continue;
-      }
-      if (i < retries - 1) continue;
-    }
-  }
-  throw err;
+function pickPropName(props, candidates) {
+  for (const name of candidates) if (props[name]) return name;
+  return null;
 }
 
-function readCivilIdFromProp(prop) {
+function readCivilId(prop) {
   if (!prop) return null;
   switch (prop.type) {
     case "title":        return normalizeCivilId(prop.title?.[0]?.plain_text);
@@ -73,152 +68,119 @@ function isStatusEmpty(prop) {
   return true;
 }
 
-function pickPropName(rowProps, candidates) {
-  for (const name of candidates) if (rowProps[name]) return name;
-  return null;
-}
-
-// ==== اكتشاف المخطط (schema) لجدول الإجازات ====
-async function detectLeaveSchema() {
-  const leaveDb = await withRetry(() => notion.databases.retrieve({ database_id: LEAVE_DB_ID }));
-  const props = leaveDb.properties || {};
-
-  // 1) Relation الذي يشير لقاعدة الموظفين
-  let relationProp = null;
-  if (RELATION_PROP_OVERRIDE && props[RELATION_PROP_OVERRIDE]?.type === "relation") {
-    relationProp = { name: RELATION_PROP_OVERRIDE, ...props[RELATION_PROP_OVERRIDE] };
-  } else {
-    for (const [name, prop] of Object.entries(props)) {
-      if (prop.type === "relation" && prop.relation?.database_id === EMPLOYEES_DB_ID) {
-        relationProp = { name, ...prop };
-        break;
+async function withRetry(fn, retries = 3) {
+  let err;
+  for (let i = 0; i < retries; i++) {
+    try { return await fn(); }
+    catch (e) {
+      err = e;
+      const rate = e?.status === 429 || e?.body?.code === "rate_limited";
+      if (rate && i < retries - 1) {
+        const wait = Math.min(2000 * (i + 1), 8000);
+        await new Promise(r => setTimeout(r, wait));
+      } else if (i < retries - 1) {
+        continue;
       }
     }
   }
-  if (!relationProp) {
-    throw new Error(
-      `لا يوجد عمود Relation يربط بقاعدة الموظفين داخل "طلبات الاجازة". `
-      + `أضِف Relation جديد يربط بقاعدة الموظفين (مثلاً اسمه "الموظف") ثم أعد التشغيل. `
-      + `أو مرر اسم العمود عبر RELATION_PROP_OVERRIDE.`
-    );
-  }
-
-  // 2) عمود حالة الطلب (فضّل الاسم المعروف، وإلا أول status/select)
-  let statusProp = null, fallback = null;
-  for (const [name, prop] of Object.entries(props)) {
-    if (name === STATUS_PREFERRED_NAME && (prop.type === "status" || prop.type === "select")) {
-      statusProp = { name, ...prop }; break;
-    }
-    if (!fallback && (prop.type === "status" || prop.type === "select")) fallback = { name, ...prop };
-  }
-  if (!statusProp && fallback) statusProp = fallback;
-
-  // 3) عمود الهوية في الإجازات
-  let leaveIdPropName = null;
-  for (const cand of LEAVE_DB_ID_PROP_CANDIDATES) if (props[cand]) { leaveIdPropName = cand; break; }
-  if (!leaveIdPropName) {
-    // آخر محاولة: التقط أول title/rich_text/number/phone/formula/rollup
-    for (const [name, prop] of Object.entries(props)) {
-      if (["title","rich_text","number","phone_number","formula","rollup"].includes(prop.type)) {
-        leaveIdPropName = name; break;
-      }
-    }
-  }
-  if (!leaveIdPropName) throw new Error("لم أجد عمودًا مناسبًا لرقم الهوية داخل طلبات الاجازة.");
-
-  console.log("Detected (Leave DB): relation=", relationProp.name, "| status=", statusProp?.name || "NONE", "| civilId=", leaveIdPropName);
-  return { relationPropName: relationProp.name, statusProp, leaveIdPropName };
+  throw err;
 }
 
-// ==== فهرس الموظفين: رقم الهوية -> page_id ====
+// ===== 1) ابنِ فهرس الموظفين: رقم الهوية -> page_id =====
 async function buildEmployeeIndex() {
   const index = {};
   let cursor;
 
   do {
     const res = await withRetry(() =>
-      notion.databases.query({ database_id: EMPLOYEES_DB_ID, start_cursor: cursor, page_size: 100 })
+      notion.databases.query({
+        database_id: EMPLOYEES_DB_ID,
+        start_cursor: cursor,
+        page_size: 100
+      })
     );
+
     for (const row of res.results) {
-      const props = row.properties;
-      const empIdPropName = pickPropName(props, EMP_DB_ID_PROP_CANDIDATES) || Object.keys(props)[0];
-      const civilId = readCivilIdFromProp(props[empIdPropName]);
-      if (civilId) index[civilId] = row.id;
+      const empProps = row.properties;
+      const empIdName = pickPropName(empProps, EMP_ID_CANDIDATES) || Object.keys(empProps)[0];
+      const civil = readCivilId(empProps[empIdName]);
+      if (civil) index[civil] = row.id;
     }
+
     cursor = res.has_more ? res.next_cursor : null;
   } while (cursor);
 
   return index;
 }
 
-// ==== ربط وتحديث الطلبات ====
-async function fixLeaveRequests(schema, employeeIndex) {
+// ===== 2) مرّ على طلبات الإجازة واربط + اضبط الحالة =====
+async function syncLeaveRequests(employeeIndex) {
   let cursor;
-
-  const filter = {
-    and: [
-      {
-        or: [
-          { property: schema.relationPropName, relation: { is_empty: true } },
-          ...(schema.statusProp?.type === "status" ? [{ property: schema.statusProp.name, status: { is_empty: true } }] : []),
-          ...(schema.statusProp?.type === "select" ? [{ property: schema.statusProp.name, select: { is_empty: true } }] : []),
-        ],
-      },
-      {
-        or: [
-          { property: schema.leaveIdPropName, rich_text: { is_not_empty: true } },
-          { property: schema.leaveIdPropName, number: { is_not_empty: true } },
-          { property: schema.leaveIdPropName, phone_number: { is_not_empty: true } },
-          { property: schema.leaveIdPropName, formula: { string: { is_not_empty: true } } },
-          { property: schema.leaveIdPropName, formula: { number: { is_not_empty: true } } },
-          { property: schema.leaveIdPropName, rollup: { any: { rich_text: { is_not_empty: true } } } },
-        ],
-      },
-    ],
-  };
 
   do {
     const res = await withRetry(() =>
       notion.databases.query({
         database_id: LEAVE_DB_ID,
         start_cursor: cursor,
-        page_size: 100,
-        filter,
+        page_size: 100
       })
     );
 
     for (const row of res.results) {
       const props = row.properties;
-      const relProp = props[schema.relationPropName];
-      const statusProp = schema.statusProp ? props[schema.statusProp.name] : null;
-      const alreadyLinked = relProp?.type === "relation" && relProp.relation?.length > 0;
 
-      const updates = {};
-
-      // Link relation إذا فاضي
-      if (!alreadyLinked) {
-        const civilId = readCivilIdFromProp(props[schema.leaveIdPropName]);
-        if (civilId) {
-          const empPage = employeeIndex[civilId];
-          if (empPage) updates[schema.relationPropName] = { relation: [{ id: empPage }] };
-          else console.log("No employee match for", civilId, "->", row.id);
-        } else {
-          console.log("Leave row has no civil id:", row.id);
-        }
+      // أسماء الحقول الفعلية في هذا الصف
+      const leaveIdName = pickPropName(props, LEAVE_ID_CANDIDATES);
+      if (!leaveIdName) {
+        console.log("⚠️ ما لقيت عمود رقم الهوية في صف:", row.id);
+        continue;
       }
 
-      // حالة الطلب = قيد الانتظار إذا فاضية
-      if (schema.statusProp && isStatusEmpty(statusProp)) {
-        if (schema.statusProp.type === "status") {
-          updates[schema.statusProp.name] = { status: { name: PENDING_STATUS_VALUE } };
-        } else if (schema.statusProp.type === "select") {
-          updates[schema.statusProp.name] = { select: { name: PENDING_STATUS_VALUE } };
+      const rel = props[RELATION_PROP_NAME];
+      const stat = props[STATUS_PROP_NAME];
+
+      const alreadyLinked = rel?.type === "relation" && rel.relation?.length > 0;
+      const needPending   = isStatusEmpty(stat);
+
+      // نقرأ رقم الهوية من الطلب
+      const civil = readCivilId(props[leaveIdName]);
+      if (!civil) {
+        // حتى لو ما فيه هوية، لو الحالة فاضية نحط قيد الانتظار فقط
+        if (needPending) {
+          await withRetry(() =>
+            notion.pages.update({
+              page_id: row.id,
+              properties: { [STATUS_PROP_NAME]: buildStatusSet(stat, PENDING_VALUE) }
+            })
+          );
+          console.log(`🟡 Pending only: ${row.id}`);
         }
+        continue;
       }
 
-      if (Object.keys(updates).length) {
-        await withRetry(() => notion.pages.update({ page_id: row.id, properties: updates }));
-        console.log(`Updated ${row.id}`);
+      const empPageId = employeeIndex[civil];
+
+      const updateProps = {};
+
+      // اربط إذا غير مربوط ويوجد موظف مطابق
+      if (!alreadyLinked && empPageId) {
+        updateProps[RELATION_PROP_NAME] = { relation: [{ id: empPageId }] };
+      }
+
+      // عيّن الحالة إذا فاضية
+      if (needPending) {
+        updateProps[STATUS_PROP_NAME] = buildStatusSet(stat, PENDING_VALUE);
+      }
+
+      if (Object.keys(updateProps).length) {
+        await withRetry(() =>
+          notion.pages.update({ page_id: row.id, properties: updateProps })
+        );
+        console.log(
+          `✅ Updated ${row.id}` +
+          (!alreadyLinked && empPageId ? " (linked)" : "") +
+          (needPending ? " (pending)" : "")
+        );
       }
     }
 
@@ -226,19 +188,28 @@ async function fixLeaveRequests(schema, employeeIndex) {
   } while (cursor);
 }
 
+// يبني قيمة التعيين للـ Status/Select حسب نوع الحقل الحالي
+function buildStatusSet(currentProp, name) {
+  const type = currentProp?.type || "status";
+  if (type === "status") return { status: { name } };
+  if (type === "select") return { select: { name } };
+  // fallback لو كان النوع غير معروف
+  return { status: { name } };
+}
+
+// ===== Run =====
 async function main() {
   if (!process.env.NOTION_TOKEN || !EMPLOYEES_DB_ID || !LEAVE_DB_ID) {
     throw new Error("Missing NOTION_TOKEN or database IDs.");
   }
 
-  console.log("Detecting schema…");
-  const schema = await detectLeaveSchema();   // ← هنا المشكلة كانت: لم يوجد Relation باسمك السابق
   console.log("Building employee index…");
-  const employeeIndex = await buildEmployeeIndex();
-  console.log("Employees indexed:", Object.keys(employeeIndex).length);
+  const idx = await buildEmployeeIndex();
+  console.log("Employees indexed:", Object.keys(idx).length);
 
-  console.log("Fixing leave requests…");
-  await fixLeaveRequests(schema, employeeIndex);
+  console.log("Syncing leave requests…");
+  await syncLeaveRequests(idx);
+
   console.log("Done ✅");
 }
 

@@ -6,8 +6,8 @@ const notion = new Client({
 });
 
 // معرفات قواعد البيانات
-const EMPLOYEES_DB_ID = process.env.EMPLOYEES_DB_ID; // قاعدة بيانات الموظفين
-const LEAVE_REQUESTS_DB_ID = process.env.LEAVE_REQUESTS_DB_ID; // قاعدة بيانات طلبات الإجازة
+const EMPLOYEES_DB_ID = process.env.DATABASE_ID_EMPLOYEES; // قاعدة بيانات الموظفين
+const LEAVE_REQUESTS_DB_ID = process.env.DATABASE_ID_LEAVE_REQUESTS; // قاعدة بيانات طلبات الإجازة
 
 // تحويل الأرقام العربية والهندية إلى أرقام إنجليزية
 function normalizeNumber(str) {

@@ -115,14 +115,30 @@ function findEmployeeRelationPropName(leaveDbSchema) {
   return null;
 }
 
-// ابحث عن حقل الحالة (يفضل status ثم select)
+// ✅ ابحث عن حقل الحالة مع أولوية للأسماء الصحيحة
 function findStatusProp(leaveDbSchema) {
   const props = leaveDbSchema.properties || {};
+  const preferredNames = ['حالة الطلب', 'الحالة', 'Status', 'State'];
+
+  // 1) status + اسم مفضل
+  for (const [propName, propDef] of Object.entries(props)) {
+    if (propDef.type === 'status' && preferredNames.includes(propName)) {
+      return { name: propName, kind: 'status', options: propDef.status?.options || [] };
+    }
+  }
+  // 2) select + اسم مفضل
+  for (const [propName, propDef] of Object.entries(props)) {
+    if (propDef.type === 'select' && preferredNames.includes(propName)) {
+      return { name: propName, kind: 'select', options: propDef.select?.options || [] };
+    }
+  }
+  // 3) أي status
   for (const [propName, propDef] of Object.entries(props)) {
     if (propDef.type === 'status') {
       return { name: propName, kind: 'status', options: propDef.status?.options || [] };
     }
   }
+  // 4) أي select
   for (const [propName, propDef] of Object.entries(props)) {
     if (propDef.type === 'select') {
       return { name: propName, kind: 'select', options: propDef.select?.options || [] };
@@ -249,7 +265,7 @@ async function updateLeaveRequestSmart({
       } else {
         properties[statusProp.name] = { select: { name: pick.name } };
       }
-      console.log(`   ↪︎ تعيين الحالة إلى: ${pick.name}${pick.exists ? '' : ' (تم إنشاؤه)'} (${statusProp.kind})`);
+      console.log(`   ↪︎ تعيين الحالة (${statusProp.name}) إلى: ${pick.name}${pick.exists ? '' : ' (تم إنشاؤه)'} (${statusProp.kind})`);
     } else {
       console.warn('⚠️ تعذّر تعيين الحالة: لا يوجد أي خيار صالح.');
     }
@@ -368,7 +384,7 @@ async function syncNotionTables() {
           updatedCount++;
           console.log(`   ✓ رقم الهوية: ${normalizedRequestId}`);
           if (needsRelationUpdate) console.log('   ✓ تم ربط الموظف');
-          if (needsStatusUpdate) console.log('   ✓ تم تعيين الحالة (إن كانت فاضية)');
+          if (needsStatusUpdate) console.log(`   ✓ تم تعيين الحالة (${statusProp.name})`);
         }
       } else {
         console.log(`✓ الطلب محدث بالفعل: ${normalizedRequestId}`);

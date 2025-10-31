@@ -9,10 +9,10 @@ const LEAVE_DB_ID = process.env.DATABASE_ID_LEAVE_REQUESTS;
 // << مهم جدا >>
 // لازم الأسماء اللي تحت تطابق أسماء الأعمدة في نوتشن حرفيًا
 // عمود رقم الهوية في الجدولين (الموظفين وطلبات الإجازة)
-const EMPLOYEE_ID_PROP = "Employee ID";
+const EMPLOYEE_ID_PROP = "رقم الهوية";
 
 // عمود الـ relation داخل جدول الإجازات (العمود اللي مفروض يمسك اسم الموظف)
-const EMPLOYEE_REL_PROP = "Employees";
+const EMPLOYEE_REL_PROP = " اسم الموظف";
 
 // helper: يطلع رقم الهوية من الحقل سواء كان نص ولا رقم ولا عنوان
 function getCivilIdFromProperty(prop) {

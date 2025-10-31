@@ -22,3 +22,14 @@
     "node": ">=14.0.0"
   }
 }
+{
+  "name": "notion-employee-sync",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node sync.js"
+  },
+  "dependencies": {
+    "@notionhq/client": "^2.2.15"
+  }
+}

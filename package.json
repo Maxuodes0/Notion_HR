@@ -6,18 +6,23 @@
   "scripts": {
     "start": "node sync.js",
     "sync": "node sync.js",
+    "send-emails": "node send-status-emails.js",
+    "sync-and-email": "npm run sync && npm run send-emails",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [
     "notion",
     "sync",
     "automation",
+    "emails",
     "github-actions"
   ],
-  "author": "",
+  "author": "Abu Jarrah",
   "license": "MIT",
   "dependencies": {
-    "@notionhq/client": "^2.2.14"
+    "@notionhq/client": "^2.2.14",
+    "nodemailer": "^6.9.13",
+    "dotenv": "^16.4.5"
   },
   "engines": {
     "node": ">=14.0.0"

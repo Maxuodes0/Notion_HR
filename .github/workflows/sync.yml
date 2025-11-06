@@ -2,8 +2,8 @@ name: Sync Notion Leave Requests
 
 on:
   schedule:
-  - cron: "0 0 * * *"     # كل يوم مرة الساعة 12 منتصف الليل
-  workflow_dispatch: {}     # تقدر تشغله يدوي
+    - cron: "0 0 * * *"     # كل يوم مرة الساعة 12 منتصف الليل (UTC)
+  workflow_dispatch: {}      # تقدر تشغله يدوي
 
 jobs:
   run-sync:
@@ -26,4 +26,13 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           DATABASE_ID_EMPLOYEES: ${{ secrets.DATABASE_ID_EMPLOYEES }}
           DATABASE_ID_LEAVE_REQUESTS: ${{ secrets.DATABASE_ID_LEAVE_REQUESTS }}
-        run: npm start
+        run: npm start   # هذا يشغّل sync.js زي أول بالضبط
+
+      - name: Run send status emails
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          DATABASE_ID_LEAVE_REQUESTS: ${{ secrets.DATABASE_ID_LEAVE_REQUESTS }}
+          MAIL_USER: ${{ secrets.MAIL_USER }}
+          MAIL_PASS: ${{ secrets.MAIL_PASS }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+        run: node send-status-emails.js

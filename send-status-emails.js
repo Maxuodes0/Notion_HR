@@ -1,3 +1,5 @@
+// send-status-emails.js
+
 require('dotenv').config();
 const { Client } = require('@notionhq/client');
 const nodemailer = require('nodemailer');
@@ -20,12 +22,13 @@ const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: {
     user: process.env.MAIL_USER,
-    pass: process.env.MAIL_PASS,
+    pass: process.env.MAIL_PASS, // بدون مسافات في السيكريت
   },
 });
 
 async function sendEmail({ to, subject, text }) {
   const from = process.env.MAIL_FROM || process.env.MAIL_USER;
+
   try {
     await transporter.sendMail({ from, to, subject, text });
     console.log(`📧 تم إرسال إيميل إلى: ${to}`);
@@ -41,81 +44,131 @@ async function sendEmail({ to, subject, text }) {
 // --------------------------------------
 function getStatus(page) {
   const prop = page.properties['حالة الطلب'];
-  return prop?.select?.name || prop?.status?.name || '';
+  if (!prop) return '';
+  if (prop.type === 'select' && prop.select) return prop.select.name || '';
+  if (prop.type === 'status' && prop.status) return prop.status.name || '';
+  return '';
 }
+
 function getEmail(page) {
-  return page.properties['الايميل']?.email || '';
+  const prop = page.properties['الايميل'];
+  if (!prop || prop.type !== 'email') return '';
+  return prop.email || '';
 }
+
 function getName(page) {
   const prop = page.properties['اسم الموظف'];
-  return prop?.title?.[0]?.plain_text || '';
+  if (!prop || prop.type !== 'title') return '';
+  return (prop.title || []).map(t => t.plain_text).join(' ').trim();
 }
+
 function getEmailFlag(page) {
   const prop = page.properties['هل تم ارسال ايميل؟'];
-  return prop?.rich_text?.[0]?.plain_text || '';
+  if (!prop || prop.type !== 'rich_text') return '';
+  return (prop.rich_text || []).map(t => t.plain_text).join(' ').trim();
 }
+
 async function setEmailFlag(pageId, text) {
   await notion.pages.update({
     page_id: pageId,
     properties: {
       'هل تم ارسال ايميل؟': {
-        rich_text: [{ type: 'text', text: { content: text } }],
+        rich_text: [
+          {
+            type: 'text',
+            text: {
+              content: text || 'تم الإرسال',
+            },
+          },
+        ],
       },
     },
   });
 }
 
 // --------------------------------------
-// نصوص الإيميلات حسب الحالة
+// نصوص الإيميل حسب حالة الطلب
 // --------------------------------------
 function getEmailContent(status, name) {
   let subject, text;
+
   switch (status) {
     case 'قيد الانتظار':
       subject = 'تم استلام طلب الإجازة';
-      text = `مرحباً ${name}،\n\nتم استلام طلب الإجازة الخاص بك وحالته الآن "قيد الانتظار".`;
+      text =
+`مرحباً ${name}،
+
+تم استلام طلب الإجازة الخاص بك، وحالته الآن "قيد الانتظار".
+سيتم مراجعة الطلب وإبلاغك بالتحديث حال توفره.
+
+مع التحية،`;
       break;
+
     case 'موافقة':
       subject = 'تمت الموافقة على طلب الإجازة';
-      text = `مرحباً ${name}،\n\nتمت الموافقة على طلب الإجازة الخاص بك، نتمنى لك إجازة سعيدة 🌴`;
+      text =
+`مرحباً ${name}،
+
+يسعدنا إبلاغك بأنه تمت الموافقة على طلب الإجازة الخاص بك ✅
+نتمنى لك إجازة سعيدة، ولا تنس التنسيق مع مديرك المباشر بخصوص تسليم المهام.
+
+مع تمنياتنا لك بالتوفيق،`;
       break;
+
     case 'مرفوضة':
       subject = 'تم رفض طلب الإجازة';
-      text = `مرحباً ${name}،\n\nنأسف، تم رفض طلب الإجازة الخاص بك. يمكنك التواصل مع الموارد البشرية لمعرفة التفاصيل.`;
+      text =
+`مرحباً ${name}،
+
+نود إبلاغك بأنه تم رفض طلب الإجازة الخاص بك.
+للاستفسار عن تفاصيل أكثر حول سبب الرفض، يمكنك التواصل مع إدارة الموارد البشرية أو مديرك المباشر.
+
+مع التحية،`;
       break;
+
     default:
-      subject = 'تحديث حالة الطلب';
-      text = `مرحباً ${name}،\n\nتم تحديث حالة الطلب إلى "${status}".`;
+      subject = 'تحديث حالة طلب الإجازة';
+      text =
+`مرحباً ${name}،
+
+تم تحديث حالة طلب الإجازة الخاص بك إلى: "${status}".
+
+مع التحية،`;
   }
+
   return { subject, text };
 }
 
 // --------------------------------------
-// قراءة جميع الطلبات من Notion
+// قراءة جميع الطلبات من قاعدة Notion
 // --------------------------------------
 async function fetchAllRequests() {
   const results = [];
   let cursor;
+
   do {
     const response = await notion.databases.query({
       database_id: LEAVE_REQUESTS_DB_ID,
       start_cursor: cursor,
       page_size: 100,
     });
+
     results.push(...response.results);
     cursor = response.has_more ? response.next_cursor : null;
   } while (cursor);
+
   return results;
 }
 
 // --------------------------------------
-// الوظيفة الرئيسية
+// الوظيفة الرئيسية مع توضيح سبب التجاوز
 // --------------------------------------
 async function run() {
   console.log('🚀 بدء فحص الحالات لإرسال الإيميلات...\n');
 
   const requests = await fetchAllRequests();
-  let sent = 0, skipped = 0;
+  let sent = 0;
+  let skipped = 0;
 
   for (const page of requests) {
     const status = getStatus(page);
@@ -123,25 +176,45 @@ async function run() {
     const name = getName(page);
     const flag = getEmailFlag(page);
 
-    if (!status || !email) {
+    console.log('------------------------------');
+    console.log(`🔎 طلب: ${name || '(بدون اسم)'}`);
+    console.log(`   حالة الطلب       : "${status || 'فاضي'}"`);
+    console.log(`   الايميل           : "${email || 'فاضي'}"`);
+    console.log(`   هل تم ارسال ايميل: "${flag || 'فاضي'}"`);
+
+    // 1) لا يوجد حالة
+    if (!status) {
+      console.log('⏭️ تم التجاوز: حالة الطلب فاضية');
       skipped++;
       continue;
     }
 
-    // إذا الحالة نفسها سبق وتم الإرسال لها → تجاوز
+    // 2) لا يوجد ايميل
+    if (!email) {
+      console.log('⏭️ تم التجاوز: الايميل فاضي');
+      skipped++;
+      continue;
+    }
+
+    // 3) سبق إرسال إيميل لنفس هذه الحالة
     if (flag && flag.trim() === status.trim()) {
-      console.log(`⏭️ ${name} (${status}) سبق إرسال إيميل`);
+      console.log('⏭️ تم التجاوز: سبق إرسال إيميل لنفس هذه الحالة');
       skipped++;
       continue;
     }
 
+    // 4) إرسال الإيميل
     const { subject, text } = getEmailContent(status, name);
+
+    console.log(`📨 محاولة إرسال إيميل إلى: ${email} (حالة: ${status})`);
     const ok = await sendEmail({ to: email, subject, text });
 
     if (ok) {
       await setEmailFlag(page.id, status);
+      console.log('✅ تم الإرسال وتحديث حقل "هل تم ارسال ايميل؟"');
       sent++;
     } else {
+      console.log('❌ فشل الإرسال لهذا الطلب');
       skipped++;
     }
   }
@@ -153,13 +226,15 @@ async function run() {
 }
 
 // --------------------------------------
-// تشغيل مباشر
+// تشغيل مباشر من السطر
 // --------------------------------------
 if (require.main === module) {
   run()
     .then(() => process.exit(0))
-    .catch(err => {
-      console.error('❌ خطأ:', err);
+    .catch((err) => {
+      console.error('❌ خطأ أثناء التنفيذ:', err);
       process.exit(1);
     });
 }
+
+module.exports = { run };
